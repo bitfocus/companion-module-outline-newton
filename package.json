@@ -1,0 +1,37 @@
+{
+	"name": "companion-module-outline-newton",
+	"version": "0.2.0",
+	"type": "module",
+	"main": "dist/main.js",
+	"license": "MIT",
+	"prettier": "@companion-module/tools/.prettierrc.json",
+	"scripts": {
+		"build": "tsc --build tsconfig.build.json --force && companion-module-build",
+		"dev": "companion-module-build --watch",
+		"typecheck": "tsc -p tsconfig.json --noEmit --incremental false",
+		"test": "yarn build && node --test tests/*.test.mjs",
+		"lint:raw": "eslint \"src/**/*.ts\" \"tests/**/*.mjs\" eslint.config.mjs",
+		"lint": "yarn lint:raw --fix"
+	},
+	"engines": {
+		"node": "^22.0"
+	},
+	"dependencies": {
+		"@companion-module/base": "~1.12.0"
+	},
+	"devDependencies": {
+		"@companion-module/tools": "^2.2.0",
+		"eslint": "^9.0.0",
+		"husky": "^9.0.0",
+		"lint-staged": "^15.0.0",
+		"prettier": "^3.0.0",
+		"typescript": "~5.6.0",
+		"typescript-eslint": "^8.0.0"
+	},
+	"lint-staged": {
+		"*.{ts,json}": [
+			"prettier --write"
+		]
+	},
+	"packageManager": "yarn@4.5.0"
+}

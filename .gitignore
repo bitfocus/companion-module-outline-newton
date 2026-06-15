@@ -1,0 +1,10 @@
+node_modules/
+dist/
+pkg/
+.yarn/
+*.tgz
+.DS_Store
+.claude/
+docs/
+*.log
+*.tmp
