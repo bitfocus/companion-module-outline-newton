@@ -1,113 +1,135 @@
 import { UDPHelper } from '@companion-module/base'
 import { EventEmitter } from 'events'
+import { isIP } from 'node:net'
+import { buildImportSignalsCommand } from './command-builder.js'
 import { PORT_METERS } from './constants.js'
 
-/**
- * VU meter listener events.
- * Each VU packet decoded into per-channel float levels (linear or dB depending on device).
- */
+const STATUS_PACKET_LENGTH = 1024
+const CHANNEL_COUNT = 16
+// 0x2B status blob meter banks (16 float32 each): peak, peak-hold and RMS for
+// Input DSP then Output DSP.
+const INPUT_PEAK_OFFSET = 0
+const INPUT_RMS_OFFSET = 128
+const OUTPUT_PEAK_OFFSET = 192
+const OUTPUT_RMS_OFFSET = 320
+const EXPIRY_MS = 3000
+const MIN_DB = -144
+
 export interface VuListenerEvents {
 	vuPacket: [data: Buffer]
 	vuLevels: [levels: VuLevels]
+	expired: []
 	error: [error: Error]
 }
 
-/**
- * Decoded VU meter levels.
- * Indices follow the device convention: 0..15 input DSP, 0..15 output DSP, etc.
- * Each level is a float; semantics depend on the firmware (typically dB or linear 0..1).
- */
+/** Documented 0x2B status meters, exposed as peak and RMS dB values. */
 export interface VuLevels {
 	inputDsp: number[]
 	outputDsp: number[]
+	inputDspRms: number[]
+	outputDspRms: number[]
 	raw: Buffer
-	format: 'float32-le-header2' | 'unknown'
+	format: 'status-1024-peak-db'
 }
 
-const DEFAULT_VU_PORT = PORT_METERS
+interface UdpRemoteInfo {
+	address?: string
+}
 
 /**
- * Listens on the VU meter UDP port (6667) for broadcast VU packets from the
- * Newton device. The exact wire format is firmware-dependent; we expose the
- * raw buffer plus a best-effort decoded view so downstream code can pick
- * whichever form it needs.
+ * Polls Newton's UDP meter/status server. The helper deliberately has no
+ * bind_port: the operating system allocates a local ephemeral port, which is
+ * where Newton sends the 1024-byte reply. Meter data stays off TCP.
  */
 export class VuListener extends EventEmitter<VuListenerEvents> {
 	private socket: UDPHelper | null = null
-	private boundPort: number
+	private expiryTimer: ReturnType<typeof setTimeout> | null = null
+	private pollTimer: ReturnType<typeof setInterval> | null = null
 
-	constructor(port: number = DEFAULT_VU_PORT) {
+	constructor(
+		private readonly host: string,
+		private readonly port: number = PORT_METERS,
+		private readonly pollIntervalMs: number = 200,
+	) {
 		super()
-		this.boundPort = port
 	}
 
-	/**
-	 * Start listening for VU packets.
-	 * UDPHelper binds to the local port and accepts broadcast/unicast.
-	 */
 	start(): void {
 		this.stop()
-		// UDPHelper signature: (host, port) — for a listener we pass localhost
-		// and the bind port. Some firmware sends VU as broadcast on the LAN; the
-		// OS-level multicast/broadcast routing handles it as long as we bound.
-		this.socket = new UDPHelper('0.0.0.0', this.boundPort, { bind_port: this.boundPort })
-
-		this.socket.on('data', (data: Buffer) => {
+		// Do not bind a fixed local port. UDPHelper binds an ephemeral local port
+		// by default, then sends each status query to Newton's server port.
+		this.socket = new UDPHelper(this.host, this.port)
+		this.socket.on('data', (data: Buffer, rinfo?: UdpRemoteInfo) => {
+			if (!this.isExpectedSource(rinfo) || data.length !== STATUS_PACKET_LENGTH) return
+			const decoded = decodeStatusMeters(data)
+			if (!decoded) return
+			this.armExpiry()
 			this.emit('vuPacket', data)
-			const decoded = this.decodeVu(data)
-			if (decoded) this.emit('vuLevels', decoded)
+			this.emit('vuLevels', decoded)
+		})
+		this.socket.on('error', (err: Error) => this.emit('error', err))
+		this.socket.on('listening', () => {
+			this.pollStatus()
+			this.pollTimer = setInterval(() => this.pollStatus(), this.pollIntervalMs)
 		})
 
-		this.socket.on('error', (err) => {
-			this.emit('error', err)
-		})
+		this.armExpiry()
 	}
 
-	/**
-	 * Stop listening and free the socket.
-	 */
 	stop(): void {
-		if (this.socket) {
-			this.socket.destroy()
-			this.socket = null
+		if (this.pollTimer) {
+			clearInterval(this.pollTimer)
+			this.pollTimer = null
 		}
+		if (this.expiryTimer) {
+			clearTimeout(this.expiryTimer)
+			this.expiryTimer = null
+		}
+		this.socket?.destroy()
+		this.socket = null
 	}
 
-	/**
-	 * Best-effort decode of a VU packet.
-	 * Newton VU packets are typically structured as a small header followed by
-	 * per-channel float32 (LE) values. Without an exact spec for this firmware
-	 * we expose the raw buffer and a generic float-array view; consumers pick.
-	 *
-	 * Heuristic: if the buffer is large enough for 16 InputDsp + 16 OutputDsp
-	 * float32 LE values plus a small header, decode that layout. Otherwise
-	 * leave decoded fields empty — the raw buffer is always available.
-	 */
-	private decodeVu(data: Buffer): VuLevels | null {
-		if (data.length < 4) return null
-
-		// Best-effort: assume a 2-byte header (cmd + flag) followed by float32 LE values.
-		// Without firmware-confirmed spec, we expose generic floats. Consumers can
-		// reinterpret using the raw buffer if their device differs.
-		const HEADER = 2
-		const FLOAT_SIZE = 4
-		const usable = Math.floor((data.length - HEADER) / FLOAT_SIZE)
-		if (usable < 32) {
-			return { inputDsp: [], outputDsp: [], raw: data, format: 'unknown' }
-		}
-
-		const inputDspCount = Math.min(16, usable)
-		const outputDspCount = Math.min(16, Math.max(0, usable - inputDspCount))
-
-		const inputDsp: number[] = []
-		for (let i = 0; i < inputDspCount; i++) {
-			inputDsp.push(data.readFloatLE(HEADER + i * FLOAT_SIZE))
-		}
-		const outputDsp: number[] = []
-		for (let i = 0; i < outputDspCount; i++) {
-			outputDsp.push(data.readFloatLE(HEADER + (inputDspCount + i) * FLOAT_SIZE))
-		}
-
-		return { inputDsp, outputDsp, raw: data, format: 'float32-le-header2' }
+	private pollStatus(): void {
+		const socket = this.socket
+		if (!socket) return
+		// This is a new real-time status sample, not a TCP retry. UDP transport
+		// deliberately provides no retransmission when a sample is lost.
+		void socket.send(buildImportSignalsCommand()).catch((err: unknown) => {
+			this.emit('error', err instanceof Error ? err : new Error(String(err)))
+		})
 	}
+
+	private armExpiry(): void {
+		if (this.expiryTimer) clearTimeout(this.expiryTimer)
+		this.expiryTimer = setTimeout(() => {
+			this.expiryTimer = null
+			this.emit('expired')
+		}, EXPIRY_MS)
+	}
+
+	private isExpectedSource(rinfo?: UdpRemoteInfo): boolean {
+		// An IP target can be checked exactly. For a DNS host we let the UDP
+		// helper resolve it and retain payload-length validation instead.
+		return isIP(this.host) === 0 || !rinfo?.address || rinfo.address === this.host
+	}
+}
+
+/** Decode the Newton 0x2B status blob's input/output peak and RMS meter banks. */
+export function decodeStatusMeters(data: Buffer): VuLevels | null {
+	if (data.length !== STATUS_PACKET_LENGTH) return null
+	const inputDsp: number[] = []
+	const outputDsp: number[] = []
+	const inputDspRms: number[] = []
+	const outputDspRms: number[] = []
+	for (let i = 0; i < CHANNEL_COUNT; i++) {
+		inputDsp.push(antilogToDb(data.readFloatLE(INPUT_PEAK_OFFSET + i * 4), 20))
+		outputDsp.push(antilogToDb(data.readFloatLE(OUTPUT_PEAK_OFFSET + i * 4), 20))
+		inputDspRms.push(antilogToDb(data.readFloatLE(INPUT_RMS_OFFSET + i * 4), 20))
+		outputDspRms.push(antilogToDb(data.readFloatLE(OUTPUT_RMS_OFFSET + i * 4), 20))
+	}
+	return { inputDsp, outputDsp, inputDspRms, outputDspRms, raw: data, format: 'status-1024-peak-db' }
+}
+
+function antilogToDb(value: number, multiplier: number): number {
+	return Number.isFinite(value) && value > 0 ? Math.max(MIN_DB, multiplier * Math.log10(value)) : MIN_DB
 }

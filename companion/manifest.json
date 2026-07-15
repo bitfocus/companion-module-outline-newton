@@ -3,14 +3,15 @@
 	"id": "outline-newton",
 	"name": "Outline Newton",
 	"shortname": "Newton",
-	"description": "Control Outline Newton DSP processors via TCP",
-	"version": "0.2.0",
+	"description": "Control Outline Newton via TCP 6668 with real-time meter polling over UDP 6667",
+	"version": "1.0.0",
 	"license": "MIT",
-	"repository": "git+https://github.com/outline/companion-module-outline-newton.git",
-	"bugs": "https://github.com/outline/companion-module-outline-newton/issues",
+	"repository": "git+https://github.com/bitfocus/companion-module-outline-newton.git",
+	"bugs": "https://github.com/bitfocus/companion-module-outline-newton/issues",
 	"maintainers": [
 		{
-			"name": "Outline"
+			"name": "Outline Software",
+			"email": "software@outline.it"
 		}
 	],
 	"runtime": {
@@ -21,6 +22,12 @@
 	},
 	"legacyIds": [],
 	"manufacturer": "Outline",
-	"products": ["Newton", "Newton One"],
-	"keywords": ["dsp", "audio", "processor"]
+	"products": [
+		"Newton"
+	],
+	"keywords": [
+		"dsp",
+		"audio",
+		"processor"
+	]
 }

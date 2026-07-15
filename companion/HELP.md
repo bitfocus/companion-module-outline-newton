@@ -1,70 +1,69 @@
 # Outline Newton
 
-Control Outline Newton and Newton One DSP processors from Bitfocus Companion.
+Control Outline Newton DSP processors from Bitfocus Companion.
 
 ## Configuration
 
-- **Device IP Address**: Newton IP address.
-- **TCP Port**: command port, default `6668`.
-- **Command Timeout**: per-command timeout for actions and polling.
-- **Debug Logging**:
-  - `Off`: quiet mode.
-  - `Errors only`: command errors and rejected replies.
-  - `Verbose hex`: raw TX/RX hex for protocol debugging.
-- **Priority Patch Polling**: reads the `0x2B` signals blob and extracts bytes `666..689`.
-- **Priority Monitor**: one selected priority patch exposed through compact variables and feedbacks.
-- **VU Meter Listener**: experimental UDP listener on port `6667`. Keep disabled unless firmware sends VU packets.
+- **Device IP Address**: the Newton's IP address.
+- **Interactivity**: choose Low, Medium or High to balance interface responsiveness and network activity. Applying a new profile recreates the UDP meter socket immediately. The control intentionally shows only profile names.
 
-## Core Actions
+Companion sends commands, configuration reads and snapshot traffic to Newton over TCP port `6668`. Real-time meter/status requests use UDP port `6667`; the operating system automatically chooses Companion's local UDP reply port.
 
-- **Set Gain**: sends command `0x01` with little-endian channel index and gain float.
-- **Set Channel Mute**: sends command `0x01` with mute flag, preserving the configured gain value.
-- **Set Delay**, **Set Polarity**, **Set Pan**, **Set Matrix Assignment**.
-- **Change Preset** and **Store Preset**.
+The UDP stream also carries the live priority-patch and clock status. If UDP `6667` is blocked between Companion and the Newton, control over TCP keeps working, but meters and the priority/clock monitors stay `N/A` and the module logs a warning — check the network path in that case.
 
-## Priority Patch Actions
+## Input patch
 
-- **Read Priority List**: sends `0x91` for one Input DSP or Aux Mixer patch. Some firmware versions reject this command; the module degrades cleanly and reports unsupported state.
-- **Rearm Priority Patch**: sends `0x90` for one patch.
-- **Rearm All Input DSP Priority Patches**: sends `0x90` to Input DSP patches `0..15`.
-- **Rearm All Aux Mixer Priority Patches**: sends `0x90` to Aux Mixer patches `0..7`.
+Priority-source monitoring and rearming for inputs `1..16`:
 
-## Priority Patch Variables
+- **Monitor Input**: set one value, "Input (1-16)", in the feedback. The button shows `IN <n>` and turns green while the input's top-priority source is playing, orange when a backup source has taken over, grey when unknown.
+- **Rearm Input**: set the input number in the label feedback. The button shows `REARM IN <n>`; pressing it puts the input back on its top-priority source.
+- **Rearm All Inputs**: rearms all 16 inputs with one press.
 
-- `$(outline-newton:priority_in_0)` to `priority_in_15`: active source for Input DSP priority patches.
-- `$(outline-newton:priority_aux_0)` to `priority_aux_7`: active source for Aux Mixer priority patches.
-- `$(outline-newton:priority_selected_active)`: active source for the configured monitored patch.
-- `$(outline-newton:priority_selected_highest)`: highest source from `0x91` when supported, otherwise configured expected source.
-- `$(outline-newton:priority_selected_forced)`: `yes`, `no`, `unsupported`, or `unknown`.
-- `$(outline-newton:priority_selected_overridden)`: `yes` when active source differs from highest/expected source.
+Some firmware doesn't report the priority list; the monitor button then stays grey.
 
-## VU Variables
+## Clock
 
-- `$(outline-newton:vu_selected)`: monitored VU channel value, or a clear status string.
-- `$(outline-newton:vu_selected_peak)`: monitored peak value.
-- `$(outline-newton:vu_selected_clip)`: `yes`, `no`, or status string.
-- `$(outline-newton:vu_raw_length)`: last UDP packet length.
-- `$(outline-newton:vu_raw_first_hex)`: first bytes of the last UDP packet.
-- `$(outline-newton:vu_format)`: decoded format or `Unknown VU format`.
+Same workflow as Input patch, for the processing clocks (Master Clock, Word Clock Out 1, Word Clock Out 2):
 
-## Debug Variables
+- **Monitor Clock**: select the clock in the feedback. The button shows the clock and its current source (e.g. `MCLK / WC`), green while its top-priority clock is running, orange when a backup has taken over.
+- **Rearm Clock**: select the clock in the label feedback; the button shows `REARM <clock>` and pressing it puts the clock back on its top-priority source.
 
-- `$(outline-newton:last_command)`
-- `$(outline-newton:last_response_hex)`
-- `$(outline-newton:last_error)`
-- `$(outline-newton:last_priority_update)`
-- `$(outline-newton:last_vu_update)`
+## Levels & Mute
 
-## Operator Examples
+Set the channel type (Input DSP or Output DSP) and the channel number `1..16` in the options:
 
-- Put a **Priority Patch Status** preset on a button to show the active source.
-- Put a **Rearm Priority Patch** preset beside it. If the status button turns orange, press rearm.
-- Enable verbose logging only during protocol debugging; it can produce a lot of hex traffic.
+- **Channel Gain**: shows the channel's live gain, e.g. `GAIN IN 3 / -6.0 dB` (or `MUTED`).
+- **Channel Mute**: a mute key. Shows `TOGGLE MUTE / IN 3 / UNMUTED` (green) or `MUTED` (red); pressing it toggles the mute, keeping the current gain. One pair of options drives both the state and the press.
+- **Level Up / Level Down**: raise or lower the gain by a chosen dB amount (0.1-24 dB per press), keeping mute. Limited to `-80..+6 dB`.
 
-## Protocol Notes
+Every gain the module writes (Set Gain, Level Up/Down, mute write-backs) is hard-clamped to the device-safe `-80..+6 dB` window: values outside this range never reach the device.
 
-- Legacy commands use the first byte as command ID.
-- Legacy success is usually `0x33 0x00`; error is `0x66 0x00`.
-- Newton 3 firmware `0.98` returns a raw 1024-byte blob for `0x2B`, not a standard OK header.
-- All 4-byte integer and float fields in legacy commands are little-endian.
-- Snapshot commands use SPC/SPR with CRC16 (`0xA001`, initial `0x0000`, CRC stored little-endian).
+Gain and mute refresh from the complete Newton audio-preset payload (`0x21`) whenever at least one Levels & Mute feedback is in use. The selected interactivity profile controls its cadence, so changes made elsewhere (another controller, the front panel, a snapshot recall) appear automatically. A Level press updates the matching Gain button immediately after the Newton ACK. Values show `--` until first read or while disconnected.
+
+## Snapshots
+
+**Apply Snapshot**: pick the snapshot by name in the label feedback; the button shows the snapshot name and pressing it applies it, with the fading time and transition mode set in the action options. The name list is read from the device when the module connects. A dropdown action, "Snapshot Apply (by name)", is also available for triggers. Run **Refresh Snapshot Database** after snapshots are added, renamed or removed outside Companion.
+
+Snapshots require Newton **firmware 0.98 or later**. The module reads the firmware version when it connects: on older firmware (e.g. 0.97) the snapshot actions are disabled with a clear log message, the snapshot button label shows `NO SNAPSHOT / FW < 0.98`, and `$(outline-newton:snapshot_support)` reads `Unsupported by firmware`. Every other feature keeps working.
+
+## Metering
+
+**Meter**: a full-height meter button. Pick the meter type (Input DSP or Output DSP), the mode (Peak or RMS) and the channel `1..16`. The bar fills the left half with an LED-segment look; the right column reads `VU`, `IN`/`OUT`, the channel number and `RMS`/`PK`. Meter data is queried from Newton's UDP server on port `6667`; the operating system chooses the local reply port. These samples are independent of commands and audio-preset reads sent over TCP port `6668`.
+
+Bands: below `-60 dB` everything is dark; from `-60` to `-40` only the blue signal LED lights; from `-40` to `0 dB` the green→yellow→red bar lights proportionally, turning yellow at `-12 dB` and red at `-6 dB`.
+
+Per-channel values are also published as `$(outline-newton:vu_input_1)`..`vu_input_16` and `vu_output_1`..`vu_output_16`.
+
+## Status
+
+- **Connection Status**: shows `NEWTON ONLINE` (green) or `OFFLINE` (red).
+- Boolean **Device Connected** and **Last Action Success/Error** feedbacks are available for triggers.
+
+## Variables
+
+- `$(outline-newton:connection_state)`: `Connected` or `Disconnected`.
+- `$(outline-newton:priority_input_1)`..`priority_input_16` and `priority_aux_input_1`..`priority_aux_input_8`: active source per priority patch (preferred 1-based names).
+- `$(outline-newton:vu_input_1)`..`vu_input_16` and `vu_output_1`..`vu_output_16`: per-channel meter levels (preferred 1-based names).
+- `priority_in_0`..`priority_in_15`, `priority_aux_0`..`priority_aux_7`, `vu_in_0`..`vu_in_15` and `vu_out_0`..`vu_out_15` remain available with their original protocol-indexed meanings for existing configurations.
+- `$(outline-newton:snapshot_support)`: `OK`, `Unknown` or `Unsupported by firmware` (firmware < 0.98).
+- `$(outline-newton:last_error)`, `last_priority_update`, `last_vu_update`: diagnostics.

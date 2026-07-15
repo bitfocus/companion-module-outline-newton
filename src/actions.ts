@@ -1,70 +1,293 @@
 import type { CompanionActionDefinitions, InstanceBase } from '@companion-module/base'
-import { ChannelType, SnapshotApplyMode, SNAPSHOT_PARTS } from './protocol/constants.js'
 import {
-	buildChangePresetCommand,
-	buildDelayCommand,
+	ChannelType,
+	ClockType,
+	GAIN_MAX_DB,
+	GAIN_MIN_DB,
+	MIN_SNAPSHOT_FIRMWARE,
+	SnapshotApplyMode,
+	clampGainDb,
+} from './protocol/constants.js'
+import {
 	buildGainCommand,
-	buildMatrixCommand,
-	buildPanCommand,
-	buildPolarityCommand,
+	buildGetClockCommand,
 	buildReadPriorityListCommand,
+	buildRearmClockCommand,
 	buildRearmPriorityCommand,
 	buildSnapshotApply,
-	buildSnapshotDelete,
 	buildSnapshotGetDatabase,
-	buildSnapshotStore,
-	buildStorePresetCommand,
 } from './protocol/command-builder.js'
-import { parsePriorityListResponse } from './protocol/command-parser.js'
+import { parseClockStateResponse, parsePriorityListResponse } from './protocol/command-parser.js'
+import { findSnapshot, snapshotPlaceholderLabel } from './snapshots.js'
+import type { NewtonActionResult } from './protocol/types.js'
 import type { NewtonTcpClient } from './protocol/tcp-client.js'
+import type { ClockPriorityState, GainReadState, PriorityListState, SnapshotInfo } from './protocol/types.js'
 
-type Logger = Pick<InstanceBase<never>, 'log'>
+type Logger = Pick<InstanceBase<never>, 'log'> & {
+	reportActionResult?: (result: NewtonActionResult) => void
+	/** Fresh confirmed state after a write: refreshes matching gain/mute buttons at once. */
+	reportGainRead?: (channelType: number, channelIndex: number, state: GainReadState) => void
+}
+
+function reportActionFailure(logger: Logger, name: string, error: string, controlId?: string): void {
+	logger.log('error', `${name}: ${error}`)
+	logger.reportActionResult?.({ name, success: false, responseHex: '', error, controlId })
+}
 
 const CHANNEL_TYPE_CHOICES = [
 	{ id: ChannelType.InputDsp, label: 'Input DSP' },
 	{ id: ChannelType.OutputDsp, label: 'Output DSP' },
-	{ id: ChannelType.InputPatch, label: 'Input Patch' },
-	{ id: ChannelType.OutputPatch, label: 'Output Patch' },
-	{ id: ChannelType.Group, label: 'Group' },
-	{ id: ChannelType.Trimmer, label: 'Trimmer' },
 	{ id: ChannelType.AuxMixer, label: 'Aux Mixer' },
-	{ id: ChannelType.Matrix, label: 'Matrix' },
+	{ id: ChannelType.MatrixMixer, label: 'Matrix Mixer' },
+	{ id: ChannelType.Trimmer, label: 'Trimmer' },
+	{ id: ChannelType.OutputGroup, label: 'Output Group' },
 ]
 
-const SNAPSHOT_PART_CHOICES = Object.entries(SNAPSHOT_PARTS).map(([key, value]) => ({
-	id: value,
-	label: key.replace(/_/g, ' '),
-}))
+const VALID_CHANNEL_TYPES = new Set<number>([
+	Number(ChannelType.InputDsp),
+	Number(ChannelType.OutputDsp),
+	Number(ChannelType.AuxMixer),
+	Number(ChannelType.MatrixMixer),
+	Number(ChannelType.Trimmer),
+	Number(ChannelType.OutputGroup),
+])
 
 async function runCommand(
 	client: NewtonTcpClient,
 	logger: Logger,
 	name: string,
 	cmd: Buffer,
+	controlId?: string,
 	options: Parameters<NewtonTcpClient['sendCommandExpect']>[1] = {},
-): Promise<void> {
+): Promise<boolean> {
 	// Keep action callbacks thin: command builders own wire layout, while the
 	// TCP client owns queuing, timeout handling, response parsing, and logging.
-	logger.log('info', `${name}: TX [${cmd.toString('hex')}]`)
 	try {
 		const result = await client.sendCommandExpect(cmd, { name, ...options })
-		const rxHex = result.rx.toString('hex')
-		if (result.success) {
-			logger.log('info', `${name}: OK RX [${rxHex}]`)
-		} else {
-			logger.log('warn', `${name}: ERR ${result.error ?? 'unknown'} RX [${rxHex}]`)
-		}
+		logger.reportActionResult?.({
+			name,
+			success: result.success,
+			responseHex: result.rx.toString('hex'),
+			error: result.error,
+			controlId,
+		})
+		if (!result.success) logger.log('warn', `${name}: ${result.error ?? 'device returned an error'}`)
+		return result.success
 	} catch (err) {
-		logger.log('error', `${name}: ${err instanceof Error ? err.message : String(err)}`)
+		const error = err instanceof Error ? err.message : String(err)
+		reportActionFailure(logger, name, error, controlId)
+		return false
 	}
 }
 
-export function getActionDefinitions(client: NewtonTcpClient, logger: Logger): CompanionActionDefinitions {
+async function buildAndRunCommand(
+	client: NewtonTcpClient,
+	logger: Logger,
+	name: string,
+	build: () => Buffer,
+	controlId?: string,
+	options: Parameters<NewtonTcpClient['sendCommandExpect']>[1] = {},
+): Promise<boolean> {
+	try {
+		return await runCommand(client, logger, name, build(), controlId, options)
+	} catch (err) {
+		const error = err instanceof Error ? err.message : String(err)
+		reportActionFailure(logger, name, error, controlId)
+		return false
+	}
+}
+
+function validChannelType(value: unknown, logger: Logger, actionName: string, controlId?: string): ChannelType | null {
+	const channelType = Number(value)
+	if (!Number.isInteger(channelType) || !VALID_CHANNEL_TYPES.has(channelType)) {
+		reportActionFailure(logger, actionName, `unsupported channel type ${String(value)}`, controlId)
+		return null
+	}
+	return channelType
+}
+
+async function readPriorityList(
+	client: NewtonTcpClient,
+	logger: Logger,
+	channelIndex: number,
+	controlId?: string,
+): Promise<PriorityListState | null> {
+	const cmd = buildReadPriorityListCommand(channelIndex)
+	try {
+		const result = await client.sendCommandExpect(cmd, {
+			name: 'Read Priority List',
+			expectedLength: 6,
+			isSuccess: (data) => data.length === 6,
+			parser: parsePriorityListResponse,
+		})
+		if (result.success && result.parsed) {
+			logger.reportActionResult?.({
+				name: 'Read Priority List',
+				success: true,
+				responseHex: result.rx.toString('hex'),
+				controlId,
+			})
+			return result.parsed
+		}
+		const error = result.error ?? 'invalid response'
+		logger.reportActionResult?.({
+			name: 'Read Priority List',
+			success: false,
+			responseHex: result.rx.toString('hex'),
+			error,
+			controlId,
+		})
+		logger.log('warn', `Read Priority List: ${error}`)
+	} catch (err) {
+		const error = err instanceof Error ? err.message : String(err)
+		reportActionFailure(logger, 'Read Priority List', error, controlId)
+	}
+	return null
+}
+
+/**
+ * Provider of the last known gain/mute of a channel, fed by the preset-audio
+ * poll while at least one Levels & Mute feedback is visible in Companion.
+ */
+export type GainReadProvider = (channelType: number, channelIndex: number) => GainReadState | undefined
+
+/**
+ * Set/toggle the mute of one channel, preserving the last known gain. The
+ * write is reported only after the device ACKs it, then the next preset-audio
+ * poll confirms (or corrects) the device state.
+ */
+async function applyChannelMute(
+	client: NewtonTcpClient,
+	logger: Logger,
+	name: string,
+	channelType: number,
+	channelIndex: number,
+	mode: 'mute' | 'unmute' | 'toggle',
+	getGainRead: GainReadProvider,
+	controlId?: string,
+): Promise<void> {
+	const current = getGainRead(channelType, channelIndex)
+	if (!current) {
+		reportActionFailure(
+			logger,
+			name,
+			'current gain/mute not read from the device yet (preset-audio polling); retry in a moment',
+			controlId,
+		)
+		return
+	}
+	const mute = mode === 'toggle' ? !current.muted : mode === 'mute'
+	// The cached gain comes from the device and may sit outside the safe write
+	// window: clamp it rather than echoing an out-of-range value back.
+	const gainDb = clampGainDb(current.gainDb)
+	const written = await buildAndRunCommand(
+		client,
+		logger,
+		name,
+		() => buildGainCommand({ channelType, channelIndex, gainDb, mute }),
+		controlId,
+	)
+	if (written) logger.reportGainRead?.(channelType, channelIndex, { gainDb, muted: mute })
+}
+
+/** Read the current list, then rearm the patch from slot 0, preserving state. */
+async function rearmInput(
+	client: NewtonTcpClient,
+	logger: Logger,
+	name: string,
+	channelIndex: number,
+	controlId?: string,
+): Promise<void> {
+	const priority = await readPriorityList(client, logger, channelIndex, controlId)
+	if (!priority) {
+		reportActionFailure(logger, name, 'cancelled because the current priority list could not be read', controlId)
+		return
+	}
+	await buildAndRunCommand(client, logger, name, () => buildRearmPriorityCommand(channelIndex, priority, 0), controlId)
+}
+
+/** Read the current clock settings (0x81), then rearm from slot 0 (0x80). */
+async function rearmClock(
+	client: NewtonTcpClient,
+	logger: Logger,
+	name: string,
+	clockType: ClockType,
+	controlId?: string,
+): Promise<void> {
+	let clock: ClockPriorityState | null = null
+	try {
+		const result = await client.sendCommandExpect(buildGetClockCommand(clockType), {
+			name: 'Get Processing Clock',
+			expectedLength: 19,
+			isSuccess: (data) => data.length === 19,
+			parser: parseClockStateResponse,
+		})
+		if (result.success && result.parsed) clock = result.parsed
+	} catch (err) {
+		reportActionFailure(logger, 'Get Processing Clock', err instanceof Error ? err.message : String(err), controlId)
+	}
+	if (!clock) {
+		reportActionFailure(logger, name, 'cancelled because the current clock settings could not be read', controlId)
+		return
+	}
+	await buildAndRunCommand(client, logger, name, () => buildRearmClockCommand(clockType, clock, 0), controlId)
+}
+
+export function getActionDefinitions(
+	client: NewtonTcpClient,
+	logger: Logger,
+	// controlId -> input number registered by the rearm label feedback.
+	rearmTargets: Map<string, number> = new Map(),
+	// controlId -> clock type registered by the clock rearm label feedback.
+	clockRearmTargets: Map<string, number> = new Map(),
+	// Snapshot database entries read from the device; the definitions are
+	// re-registered whenever this list changes so the dropdown stays current.
+	snapshotList: SnapshotInfo[] = [],
+	// controlId -> snapshot uuid registered by the snapshot label feedback.
+	snapshotTargets: Map<string, string> = new Map(),
+	// controlId -> channel registered by the channel-mute feedback.
+	muteTargets: Map<string, { channelType: number; channelIndex: number }> = new Map(),
+	// Last known gain/mute per channel, fed by the preset-audio poll.
+	getGainRead: GainReadProvider = () => undefined,
+	// True when the connected firmware predates snapshots (< 0.98); the
+	// snapshot actions then fail fast with a clear message.
+	snapshotsUnsupported: () => boolean = () => false,
+	// Distinguishes a successfully read empty database from one not read yet.
+	snapshotDatabaseLoaded: () => boolean = () => false,
+): CompanionActionDefinitions {
+	const snapshotChoices = [
+		{
+			id: '',
+			label: snapshotPlaceholderLabel(snapshotList.length, snapshotsUnsupported(), snapshotDatabaseLoaded()),
+		},
+		...snapshotList.map((snapshot) => ({ id: snapshot.uuid, label: snapshot.name })),
+	]
 	return {
+		legacy_unsafe_action: {
+			name: 'Blocked legacy Newton action',
+			description: 'This saved action is no longer supported and was disabled during an update.',
+			options: [
+				{
+					type: 'textinput',
+					label: 'Reason',
+					id: 'reason',
+					default: '',
+				},
+			],
+			callback: async (action) => {
+				reportActionFailure(
+					logger,
+					'Blocked legacy Newton action',
+					String(action.options['reason'] ?? 'review and recreate it'),
+					action.controlId,
+				)
+			},
+		},
+
 		// ===== Gain =====
 		set_gain: {
-			name: 'Set Gain',
-			description: 'Set gain level for a specific channel',
+			name: 'Set Gain and Mute State',
+			description: "Set a channel's gain and mute state together.",
 			options: [
 				{
 					type: 'dropdown',
@@ -86,8 +309,8 @@ export function getActionDefinitions(client: NewtonTcpClient, logger: Logger): C
 					label: 'Gain (dB)',
 					id: 'gainDb',
 					default: 0,
-					min: -100,
-					max: 20,
+					min: GAIN_MIN_DB,
+					max: GAIN_MAX_DB,
 					step: 0.1,
 				},
 				{
@@ -98,268 +321,51 @@ export function getActionDefinitions(client: NewtonTcpClient, logger: Logger): C
 				},
 			],
 			callback: async (action) => {
+				const channelType = validChannelType(action.options['channelType'], logger, 'Set Gain', action.controlId)
+				if (channelType === null) return
 				const params = {
-					channelType: Number(action.options['channelType']),
+					channelType,
 					channelIndex: Number(action.options['channelIndex']),
-					gainDb: Number(action.options['gainDb']),
+					// The UI enforces min/max, but trigger expressions can inject any
+					// number: clamp to the device-safe window before building.
+					gainDb: clampGainDb(Number(action.options['gainDb'])),
 					mute: Boolean(action.options['mute']),
 				}
-				const cmd = buildGainCommand(params)
-				await runCommand(client, logger, 'Set Gain', cmd)
+				await buildAndRunCommand(client, logger, 'Set Gain', () => buildGainCommand(params), action.controlId)
 			},
 		},
 
-		// ===== Mute (via Gain command, byte 10) =====
-		set_mute: {
-			name: 'Set Channel Mute',
-			description: 'Mute or unmute a specific channel via the Gain command',
+		// ===== Snapshot database refresh =====
+		snapshot_get_database: {
+			name: 'Refresh Snapshot Database',
+			description:
+				'Read the current snapshot list from Newton again. Use this after snapshots are changed outside Companion.',
+			options: [],
+			callback: async (action) => {
+				if (snapshotsUnsupported()) {
+					reportActionFailure(
+						logger,
+						'Refresh Snapshot Database',
+						`snapshots require Newton firmware ${MIN_SNAPSHOT_FIRMWARE} or later`,
+						action.controlId,
+					)
+					return
+				}
+				await runCommand(client, logger, 'Refresh Snapshot Database', buildSnapshotGetDatabase(), action.controlId)
+			},
+		},
+
+		// ===== Snapshot Apply (by name) =====
+		snapshot_apply_selected: {
+			name: 'Snapshot Apply (by name)',
+			description: 'Apply a snapshot chosen by name. The list is read from the device when the module connects.',
 			options: [
 				{
 					type: 'dropdown',
-					label: 'Channel Type',
-					id: 'channelType',
-					default: ChannelType.InputDsp,
-					choices: CHANNEL_TYPE_CHOICES,
-				},
-				{
-					type: 'number',
-					label: 'Channel Index',
-					id: 'channelIndex',
-					default: 0,
-					min: 0,
-					max: 287,
-				},
-				{
-					type: 'number',
-					label: 'Gain (dB) - current value to preserve',
-					id: 'gainDb',
-					default: 0,
-					min: -100,
-					max: 20,
-					step: 0.1,
-				},
-				{
-					type: 'dropdown',
-					label: 'Mute',
-					id: 'mute',
-					default: 1,
-					choices: [
-						{ id: 1, label: 'Mute' },
-						{ id: 0, label: 'Unmute' },
-					],
-				},
-			],
-			callback: async (action) => {
-				// Newton's per-channel mute travels on the Gain command. The current
-				// gain is therefore an explicit option so muting does not overwrite it.
-				const cmd = buildGainCommand({
-					channelType: Number(action.options['channelType']),
-					channelIndex: Number(action.options['channelIndex']),
-					gainDb: Number(action.options['gainDb']),
-					mute: Number(action.options['mute']) === 1,
-				})
-				await runCommand(client, logger, 'Set Channel Mute', cmd)
-			},
-		},
-
-		// ===== Delay =====
-		set_delay: {
-			name: 'Set Delay',
-			description: 'Set delay for a channel',
-			options: [
-				{
-					type: 'dropdown',
-					label: 'Channel Type',
-					id: 'channelType',
-					default: ChannelType.InputDsp,
-					choices: CHANNEL_TYPE_CHOICES,
-				},
-				{
-					type: 'number',
-					label: 'Channel Index',
-					id: 'channelIndex',
-					default: 0,
-					min: 0,
-					max: 287,
-				},
-				{
-					type: 'number',
-					label: 'Delay (ms)',
-					id: 'delayMs',
-					default: 0,
-					min: 0,
-					max: 8000,
-					step: 0.01,
-				},
-			],
-			callback: async (action) => {
-				const cmd = buildDelayCommand({
-					channelType: Number(action.options['channelType']),
-					channelIndex: Number(action.options['channelIndex']),
-					delayMs: Number(action.options['delayMs']),
-				})
-				await runCommand(client, logger, 'Set Delay', cmd)
-			},
-		},
-
-		// ===== Change Preset =====
-		change_preset: {
-			name: 'Change Preset',
-			description: 'Switch to a different preset',
-			options: [
-				{
-					type: 'number',
-					label: 'Preset Number',
-					id: 'preset',
-					default: 0,
-					min: 0,
-					max: 255,
-				},
-			],
-			callback: async (action) => {
-				const cmd = buildChangePresetCommand(Number(action.options['preset']))
-				await runCommand(client, logger, 'Change Preset', cmd)
-			},
-		},
-
-		// ===== Store Preset =====
-		store_preset: {
-			name: 'Store Preset',
-			description: 'Save the current configuration to a preset',
-			options: [
-				{
-					type: 'number',
-					label: 'Preset Number',
-					id: 'preset',
-					default: 0,
-					min: 0,
-					max: 255,
-				},
-			],
-			callback: async (action) => {
-				const cmd = buildStorePresetCommand(Number(action.options['preset']))
-				await runCommand(client, logger, 'Store Preset', cmd)
-			},
-		},
-
-		// ===== Polarity =====
-		set_polarity: {
-			name: 'Set Polarity',
-			description: 'Set channel polarity (normal or inverted)',
-			options: [
-				{
-					type: 'dropdown',
-					label: 'Channel Type',
-					id: 'channelType',
-					default: ChannelType.InputDsp,
-					choices: CHANNEL_TYPE_CHOICES,
-				},
-				{
-					type: 'number',
-					label: 'Channel Index',
-					id: 'channelIndex',
-					default: 0,
-					min: 0,
-					max: 287,
-				},
-				{
-					type: 'checkbox',
-					label: 'Invert',
-					id: 'inverted',
-					default: false,
-				},
-			],
-			callback: async (action) => {
-				const cmd = buildPolarityCommand({
-					channelType: Number(action.options['channelType']),
-					channelIndex: Number(action.options['channelIndex']),
-					inverted: Boolean(action.options['inverted']),
-				})
-				await runCommand(client, logger, 'Set Polarity', cmd)
-			},
-		},
-
-		// ===== Pan =====
-		set_pan: {
-			name: 'Set Pan',
-			description: 'Set pan position for a channel (-1.0 to 1.0)',
-			options: [
-				{
-					type: 'dropdown',
-					label: 'Channel Type',
-					id: 'channelType',
-					default: ChannelType.InputDsp,
-					choices: CHANNEL_TYPE_CHOICES,
-				},
-				{
-					type: 'number',
-					label: 'Channel Index',
-					id: 'channelIndex',
-					default: 0,
-					min: 0,
-					max: 287,
-				},
-				{
-					type: 'number',
-					label: 'Pan (-1.0 to 1.0)',
-					id: 'panValue',
-					default: 0,
-					min: -1,
-					max: 1,
-					step: 0.01,
-				},
-			],
-			callback: async (action) => {
-				const cmd = buildPanCommand(
-					Number(action.options['channelType']),
-					Number(action.options['channelIndex']),
-					Number(action.options['panValue']),
-				)
-				await runCommand(client, logger, 'Set Pan', cmd)
-			},
-		},
-
-		// ===== Matrix =====
-		set_matrix: {
-			name: 'Set Matrix Assignment',
-			description: 'Assign an input to an output in the routing matrix',
-			options: [
-				{
-					type: 'number',
-					label: 'Output Channel',
-					id: 'outputChannel',
-					default: 0,
-					min: 0,
-					max: 15,
-				},
-				{
-					type: 'number',
-					label: 'Input Value',
-					id: 'inputValue',
-					default: 0,
-					min: 0,
-					max: 15,
-				},
-			],
-			callback: async (action) => {
-				const cmd = buildMatrixCommand({
-					outputChannel: Number(action.options['outputChannel']),
-					inputValue: Number(action.options['inputValue']),
-				})
-				await runCommand(client, logger, 'Set Matrix Assignment', cmd)
-			},
-		},
-
-		// ===== Snapshot Apply =====
-		snapshot_apply: {
-			name: 'Snapshot Apply',
-			description: 'Apply a saved snapshot with optional fading',
-			options: [
-				{
-					type: 'textinput',
-					label: 'Snapshot UUID',
+					label: 'Snapshot',
 					id: 'uuid',
-					required: true,
+					default: '',
+					choices: snapshotChoices,
 				},
 				{
 					type: 'number',
@@ -379,133 +385,244 @@ export function getActionDefinitions(client: NewtonTcpClient, logger: Logger): C
 						{ id: SnapshotApplyMode.ThroughZero, label: 'Through Zero' },
 					],
 				},
-				{
-					type: 'multidropdown',
-					label: 'Parts to Recall',
-					id: 'parts',
-					default: ['/'],
-					choices: SNAPSHOT_PART_CHOICES,
-				},
 			],
 			callback: async (action) => {
-				const parts = action.options['parts'] as string[] | undefined
-				// Empty selection means "device default"; otherwise send the selected
-				// recall areas exactly as Special Protocol JSON expects them.
-				const cmd = buildSnapshotApply({
-					uuid: String(action.options['uuid']),
-					fadingTime: Number(action.options['fadingTime']),
-					mode: String(action.options['mode']) as SnapshotApplyMode,
-					parts: parts && parts.length > 0 ? parts : undefined,
-				})
-				await runCommand(client, logger, 'Snapshot Apply', cmd)
+				if (snapshotsUnsupported()) {
+					reportActionFailure(
+						logger,
+						'Snapshot Apply (by name)',
+						`snapshots require Newton firmware ${MIN_SNAPSHOT_FIRMWARE} or later`,
+						action.controlId,
+					)
+					return
+				}
+				const uuid = String(action.options['uuid'] ?? '').trim()
+				if (!uuid) {
+					reportActionFailure(
+						logger,
+						'Snapshot Apply (by name)',
+						'no snapshot selected; read the device database first',
+						action.controlId,
+					)
+					return
+				}
+				if (!findSnapshot(snapshotList, uuid)) {
+					// Before the database has been (re)read an unknown uuid is not
+					// proven missing: fail soft instead of blaming the selection.
+					if (!snapshotDatabaseLoaded()) {
+						reportActionFailure(
+							logger,
+							'Snapshot Apply (by name)',
+							'the snapshot database has not been read from the device yet; retry in a moment',
+							action.controlId,
+						)
+						return
+					}
+					reportActionFailure(
+						logger,
+						'Snapshot Apply (by name)',
+						'the selected snapshot no longer exists on the device; read the database again and select a current snapshot',
+						action.controlId,
+					)
+					return
+				}
+				const fadingTime = Number(action.options['fadingTime'])
+				if (
+					!Number.isInteger(fadingTime) ||
+					fadingTime < 0 ||
+					fadingTime > 65535 ||
+					(fadingTime > 0 && fadingTime < 2000)
+				) {
+					reportActionFailure(
+						logger,
+						'Snapshot Apply (by name)',
+						'fading time must be 0 or between 2000 and 65535 ms',
+						action.controlId,
+					)
+					return
+				}
+				await buildAndRunCommand(
+					client,
+					logger,
+					'Snapshot Apply (by name)',
+					() =>
+						buildSnapshotApply({
+							uuid,
+							fadingTime,
+							mode: String(action.options['mode']) as SnapshotApplyMode,
+						}),
+					action.controlId,
+				)
 			},
 		},
 
-		// ===== Snapshot Store =====
-		snapshot_store: {
-			name: 'Snapshot Store',
-			description: 'Create a new snapshot on the device',
+		// ===== Snapshot Apply (from the button's label feedback) =====
+		apply_this_snapshot: {
+			name: 'Apply This Button Snapshot',
+			description: "Applies the snapshot chosen in this button's Snapshot label feedback.",
 			options: [
-				{
-					type: 'textinput',
-					label: 'Author',
-					id: 'author',
-					default: '',
-				},
-				{
-					type: 'textinput',
-					label: 'Description',
-					id: 'description',
-					default: '',
-				},
-				{
-					type: 'textinput',
-					label: 'Place',
-					id: 'place',
-					default: '',
-				},
-			],
-			callback: async (action) => {
-				const params: Record<string, unknown> = {}
-				const author = String(action.options['author'] ?? '')
-				const description = String(action.options['description'] ?? '')
-				const place = String(action.options['place'] ?? '')
-				if (author) params.author = author
-				if (description) params.description = description
-				if (place) params.place = place
-
-				const cmd = buildSnapshotStore(params)
-				await runCommand(client, logger, 'Snapshot Store', cmd)
-			},
-		},
-
-		// ===== Snapshot Delete =====
-		snapshot_delete: {
-			name: 'Snapshot Delete',
-			description: 'Delete a snapshot by UUID',
-			options: [
-				{
-					type: 'textinput',
-					label: 'Snapshot UUID',
-					id: 'uuid',
-					required: true,
-				},
-			],
-			callback: async (action) => {
-				const cmd = buildSnapshotDelete(String(action.options['uuid']))
-				await runCommand(client, logger, 'Snapshot Delete', cmd)
-			},
-		},
-
-		// ===== Snapshot Get Database =====
-		snapshot_get_database: {
-			name: 'Snapshot Get Database',
-			description: 'Retrieve the full snapshot database from the device',
-			options: [],
-			callback: async () => {
-				const cmd = buildSnapshotGetDatabase()
-				await runCommand(client, logger, 'Snapshot Get Database', cmd)
-			},
-		},
-
-		// ===== Rearm Priority Patch =====
-		read_priority_list: {
-			name: 'Read Priority List',
-			description: 'Read priority source list for one Input DSP or Aux Mixer patch (0x91, optional firmware support)',
-			options: [
-				{
-					type: 'dropdown',
-					label: 'Channel Type',
-					id: 'channelType',
-					default: ChannelType.InputDsp,
-					choices: [
-						{ id: ChannelType.InputDsp, label: 'Input DSP (0..15)' },
-						{ id: ChannelType.AuxMixer, label: 'Aux Mixer (0..7)' },
-					],
-				},
 				{
 					type: 'number',
-					label: 'Channel Index',
-					id: 'channelIndex',
-					default: 0,
+					label: 'Fading Time (ms)',
+					id: 'fadingTime',
+					default: 2000,
 					min: 0,
-					max: 15,
+					max: 65535,
+				},
+				{
+					type: 'dropdown',
+					label: 'Transition Mode',
+					id: 'mode',
+					default: SnapshotApplyMode.Direct,
+					choices: [
+						{ id: SnapshotApplyMode.Direct, label: 'Direct' },
+						{ id: SnapshotApplyMode.ThroughZero, label: 'Through Zero' },
+					],
 				},
 			],
 			callback: async (action) => {
-				const channelType = Number(action.options['channelType'])
-				const channelIndex = Number(action.options['channelIndex'])
-				const cmd = buildReadPriorityListCommand(channelType, channelIndex)
-				await runCommand(client, logger, 'Read Priority List', cmd, {
-					parser: parsePriorityListResponse,
-				})
+				if (snapshotsUnsupported()) {
+					reportActionFailure(
+						logger,
+						'Apply This Button Snapshot',
+						`snapshots require Newton firmware ${MIN_SNAPSHOT_FIRMWARE} or later`,
+						action.controlId,
+					)
+					return
+				}
+				const uuid = snapshotTargets.get(action.controlId)
+				if (!uuid) {
+					reportActionFailure(
+						logger,
+						'Apply This Button Snapshot',
+						'add the "Snapshot - Apply Button Label" feedback to this button and select the snapshot',
+						action.controlId,
+					)
+					return
+				}
+				if (!findSnapshot(snapshotList, uuid)) {
+					if (!snapshotDatabaseLoaded()) {
+						reportActionFailure(
+							logger,
+							'Apply This Button Snapshot',
+							'the snapshot database has not been read from the device yet; retry in a moment',
+							action.controlId,
+						)
+						return
+					}
+					snapshotTargets.delete(action.controlId)
+					reportActionFailure(
+						logger,
+						'Apply This Button Snapshot',
+						'the selected snapshot no longer exists on the device; select it again in the Snapshot label feedback',
+						action.controlId,
+					)
+					return
+				}
+				const fadingTime = Number(action.options['fadingTime'])
+				if (
+					!Number.isInteger(fadingTime) ||
+					fadingTime < 0 ||
+					fadingTime > 65535 ||
+					(fadingTime > 0 && fadingTime < 2000)
+				) {
+					reportActionFailure(
+						logger,
+						'Apply This Button Snapshot',
+						'fading time must be 0 or between 2000 and 65535 ms',
+						action.controlId,
+					)
+					return
+				}
+				await buildAndRunCommand(
+					client,
+					logger,
+					'Apply This Button Snapshot',
+					() =>
+						buildSnapshotApply({
+							uuid,
+							fadingTime,
+							mode: String(action.options['mode']) as SnapshotApplyMode,
+						}),
+					action.controlId,
+				)
+			},
+		},
+
+		// ===== Hardware-to-Logic priority (Input DSP only) =====
+		read_priority_list: {
+			name: 'Read Priority List',
+			description: 'Read the priority source list of one input (1-16).',
+			options: [
+				{
+					type: 'number',
+					label: 'Input (1-16)',
+					id: 'channelIndex',
+					default: 1,
+					min: 1,
+					max: 16,
+				},
+			],
+			callback: async (action) => {
+				// Operators enter inputs 1-16; the protocol addresses channels 0-15.
+				const input = Number(action.options['channelIndex'])
+				if (!Number.isInteger(input) || input < 1 || input > 16) {
+					reportActionFailure(logger, 'Read Priority List', 'input must be between 1 and 16', action.controlId)
+					return
+				}
+				await readPriorityList(client, logger, input - 1, action.controlId)
 			},
 		},
 
 		rearm_priority: {
 			name: 'Rearm Priority Patch',
 			description:
-				'Force a priority patch back to automatic mode (clear manual override) so the highest-available source becomes active',
+				'Rearm one input (1-16) so its highest-priority source takes over again, keeping the current source list.',
+			options: [
+				{
+					type: 'number',
+					label: 'Input (1-16)',
+					id: 'channelIndex',
+					default: 1,
+					min: 1,
+					max: 16,
+				},
+			],
+			callback: async (action) => {
+				// Operators enter inputs 1-16; the protocol addresses channels 0-15.
+				const input = Number(action.options['channelIndex'])
+				if (!Number.isInteger(input) || input < 1 || input > 16) {
+					reportActionFailure(logger, 'Rearm Priority Patch', 'input must be between 1 and 16', action.controlId)
+					return
+				}
+				await rearmInput(client, logger, 'Rearm Priority Patch', input - 1, action.controlId)
+			},
+		},
+
+		rearm_this_input: {
+			name: 'Rearm This Button Input',
+			description: "Rearms the input chosen in this button's Rearm label feedback.",
+			options: [],
+			callback: async (action) => {
+				const input = rearmTargets.get(action.controlId)
+				if (!input) {
+					reportActionFailure(
+						logger,
+						'Rearm This Button Input',
+						'add the "Input Patch - Rearm Button Label" feedback to this button and set the input number',
+						action.controlId,
+					)
+					return
+				}
+				await rearmInput(client, logger, 'Rearm This Button Input', input - 1, action.controlId)
+			},
+		},
+
+		// ===== Level Up / Down =====
+		adjust_gain: {
+			name: 'Level Up / Down',
+			description:
+				"Raise or lower a channel's gain by a chosen dB amount, keeping its mute state. Limited to -80…+6 dB.",
 			options: [
 				{
 					type: 'dropdown',
@@ -513,55 +630,256 @@ export function getActionDefinitions(client: NewtonTcpClient, logger: Logger): C
 					id: 'channelType',
 					default: ChannelType.InputDsp,
 					choices: [
-						{ id: ChannelType.InputDsp, label: 'Input DSP (0..15)' },
-						{ id: ChannelType.AuxMixer, label: 'Aux Mixer (0..7)' },
+						{ id: ChannelType.InputDsp, label: 'Input DSP' },
+						{ id: ChannelType.OutputDsp, label: 'Output DSP' },
 					],
 				},
 				{
 					type: 'number',
-					label: 'Channel Index',
-					id: 'channelIndex',
-					default: 0,
-					min: 0,
-					max: 15,
+					label: 'Channel (1-16)',
+					id: 'channel',
+					default: 1,
+					min: 1,
+					max: 16,
+				},
+				{
+					type: 'dropdown',
+					label: 'Direction',
+					id: 'direction',
+					default: 'up',
+					choices: [
+						{ id: 'up', label: 'Up (+)' },
+						{ id: 'down', label: 'Down (-)' },
+					],
+				},
+				{
+					type: 'number',
+					label: 'Amount (dB)',
+					id: 'deltaDb',
+					default: 1,
+					min: 0.1,
+					max: 24,
+					step: 0.1,
 				},
 			],
 			callback: async (action) => {
+				const name = 'Level Up / Down'
 				const channelType = Number(action.options['channelType'])
-				const channelIndex = Number(action.options['channelIndex'])
-				const cmd = buildRearmPriorityCommand(channelType, channelIndex)
-				await runCommand(client, logger, 'Rearm Priority Patch', cmd)
-			},
-		},
-
-		rearm_all_input_priority: {
-			name: 'Rearm All Input DSP Priority Patches',
-			description: 'Send 0x90 rearm to all 16 Input DSP priority patches',
-			options: [],
-			callback: async () => {
-				for (let i = 0; i < 16; i++) {
-					await runCommand(
-						client,
-						logger,
-						`Rearm Input DSP Priority ${i}`,
-						buildRearmPriorityCommand(ChannelType.InputDsp, i),
-					)
+				if (channelType !== Number(ChannelType.InputDsp) && channelType !== Number(ChannelType.OutputDsp)) {
+					reportActionFailure(logger, name, 'channel type must be Input DSP or Output DSP', action.controlId)
+					return
 				}
+				// Operators enter channels 1-16; the protocol addresses 0-15.
+				const channel = Number(action.options['channel'])
+				if (!Number.isInteger(channel) || channel < 1 || channel > 16) {
+					reportActionFailure(logger, name, 'channel must be between 1 and 16', action.controlId)
+					return
+				}
+				const deltaDb = Number(action.options['deltaDb'])
+				if (!Number.isFinite(deltaDb) || deltaDb <= 0 || deltaDb > 24) {
+					reportActionFailure(logger, name, 'amount must be between 0.1 and 24 dB', action.controlId)
+					return
+				}
+				const channelIndex = channel - 1
+				const current = getGainRead(channelType, channelIndex)
+				if (!current) {
+					reportActionFailure(
+						logger,
+						name,
+						'current gain not read from the device yet (preset-audio polling); retry in a moment',
+						action.controlId,
+					)
+					return
+				}
+				const signed = action.options['direction'] === 'down' ? -deltaDb : deltaDb
+				const gainDb = clampGainDb(current.gainDb + signed)
+				const written = await buildAndRunCommand(
+					client,
+					logger,
+					name,
+					() => buildGainCommand({ channelType, channelIndex, gainDb, mute: current.muted }),
+					action.controlId,
+				)
+				// Update button state only after the device ACKs the write; the next
+				// preset-audio poll then confirms the device's own state.
+				if (written) logger.reportGainRead?.(channelType, channelIndex, { gainDb, muted: current.muted })
 			},
 		},
 
-		rearm_all_aux_priority: {
-			name: 'Rearm All Aux Mixer Priority Patches',
-			description: 'Send 0x90 rearm to all 8 Aux Mixer priority patches',
-			options: [],
-			callback: async () => {
-				for (let i = 0; i < 8; i++) {
-					await runCommand(
-						client,
+		set_channel_mute: {
+			name: 'Channel Mute (set/toggle)',
+			description: 'Mute, unmute or toggle a channel, keeping its gain.',
+			options: [
+				{
+					type: 'dropdown',
+					label: 'Channel Type',
+					id: 'channelType',
+					default: ChannelType.InputDsp,
+					choices: [
+						{ id: ChannelType.InputDsp, label: 'Input DSP' },
+						{ id: ChannelType.OutputDsp, label: 'Output DSP' },
+					],
+				},
+				{
+					type: 'number',
+					label: 'Channel (1-16)',
+					id: 'channel',
+					default: 1,
+					min: 1,
+					max: 16,
+				},
+				{
+					type: 'dropdown',
+					label: 'Mode',
+					id: 'mode',
+					default: 'toggle',
+					choices: [
+						{ id: 'toggle', label: 'Toggle' },
+						{ id: 'mute', label: 'Mute' },
+						{ id: 'unmute', label: 'Unmute' },
+					],
+				},
+			],
+			callback: async (action) => {
+				const name = 'Channel Mute (set/toggle)'
+				const channelType = Number(action.options['channelType'])
+				if (channelType !== Number(ChannelType.InputDsp) && channelType !== Number(ChannelType.OutputDsp)) {
+					reportActionFailure(logger, name, 'channel type must be Input DSP or Output DSP', action.controlId)
+					return
+				}
+				// Operators enter channels 1-16; the protocol addresses 0-15.
+				const channel = Number(action.options['channel'])
+				if (!Number.isInteger(channel) || channel < 1 || channel > 16) {
+					reportActionFailure(logger, name, 'channel must be between 1 and 16', action.controlId)
+					return
+				}
+				const mode = String(action.options['mode'])
+				if (mode !== 'toggle' && mode !== 'mute' && mode !== 'unmute') {
+					reportActionFailure(logger, name, 'invalid mode', action.controlId)
+					return
+				}
+				await applyChannelMute(client, logger, name, channelType, channel - 1, mode, getGainRead, action.controlId)
+			},
+		},
+
+		mute_this_channel: {
+			name: 'Mute This Button Channel',
+			description: "Mutes/toggles the channel chosen in this button's Channel Mute feedback.",
+			options: [
+				{
+					type: 'dropdown',
+					label: 'Mode',
+					id: 'mode',
+					default: 'toggle',
+					choices: [
+						{ id: 'toggle', label: 'Toggle' },
+						{ id: 'mute', label: 'Mute' },
+						{ id: 'unmute', label: 'Unmute' },
+					],
+				},
+			],
+			callback: async (action) => {
+				const name = 'Mute This Button Channel'
+				const target = muteTargets.get(action.controlId)
+				if (!target) {
+					reportActionFailure(
 						logger,
-						`Rearm Aux Mixer Priority ${i}`,
-						buildRearmPriorityCommand(ChannelType.AuxMixer, i),
+						name,
+						'add the "Levels - Channel Mute" feedback to this button and set the channel',
+						action.controlId,
 					)
+					return
+				}
+				const mode = String(action.options['mode'])
+				if (mode !== 'toggle' && mode !== 'mute' && mode !== 'unmute') {
+					reportActionFailure(logger, name, 'invalid mode', action.controlId)
+					return
+				}
+				await applyChannelMute(
+					client,
+					logger,
+					name,
+					target.channelType,
+					target.channelIndex,
+					mode,
+					getGainRead,
+					action.controlId,
+				)
+			},
+		},
+
+		rearm_clock: {
+			name: 'Rearm Clock',
+			description: 'Rearm a clock (Master or Word Clock Out) so its highest-priority source takes over again.',
+			options: [
+				{
+					type: 'dropdown',
+					label: 'Clock',
+					id: 'clockType',
+					default: ClockType.Master,
+					choices: [
+						{ id: ClockType.Master, label: 'Master Clock' },
+						{ id: ClockType.WordClockOut1, label: 'Word Clock Out 1' },
+						{ id: ClockType.WordClockOut2, label: 'Word Clock Out 2' },
+					],
+				},
+			],
+			callback: async (action) => {
+				const clockType = Number(action.options['clockType'])
+				if (!Number.isInteger(clockType) || clockType < 0 || clockType > 2) {
+					reportActionFailure(logger, 'Rearm Clock', 'invalid clock type', action.controlId)
+					return
+				}
+				await rearmClock(client, logger, 'Rearm Clock', clockType, action.controlId)
+			},
+		},
+
+		rearm_this_clock: {
+			name: 'Rearm This Button Clock',
+			description: "Rearms the clock chosen in this button's Clock Rearm label feedback.",
+			options: [],
+			callback: async (action) => {
+				const clockType = clockRearmTargets.get(action.controlId)
+				if (clockType === undefined) {
+					reportActionFailure(
+						logger,
+						'Rearm This Button Clock',
+						'add the "Clock - Rearm Button Label" feedback to this button and select the clock',
+						action.controlId,
+					)
+					return
+				}
+				await rearmClock(client, logger, 'Rearm This Button Clock', clockType, action.controlId)
+			},
+		},
+
+		rearm_all_inputs: {
+			name: 'Rearm All Inputs',
+			description: 'Rearm all 16 inputs at once.',
+			options: [],
+			callback: async (action) => {
+				const name = 'Rearm All Inputs'
+				// Inputs are reported 1-based to operators; the protocol uses 0-15.
+				const failedInputs: number[] = []
+				for (let channelIndex = 0; channelIndex < 16; channelIndex++) {
+					const priority = await readPriorityList(client, logger, channelIndex, action.controlId)
+					if (!priority) {
+						failedInputs.push(channelIndex + 1)
+						continue
+					}
+					try {
+						const result = await client.sendCommandExpect(buildRearmPriorityCommand(channelIndex, priority, 0), {
+							name,
+						})
+						if (!result.success) failedInputs.push(channelIndex + 1)
+					} catch {
+						failedInputs.push(channelIndex + 1)
+					}
+				}
+				if (failedInputs.length === 0) {
+					logger.reportActionResult?.({ name, success: true, responseHex: '', controlId: action.controlId })
+				} else {
+					reportActionFailure(logger, name, `failed on input(s) ${failedInputs.join(', ')}`, action.controlId)
 				}
 			},
 		},

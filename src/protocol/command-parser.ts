@@ -1,6 +1,11 @@
 import {
+	CLOCK_LIST_LENGTH,
+	CLOCK_TYPE_COUNT,
+	REPLY_ERR,
 	REPLY_OK,
 	SIGNALS_AUX_MIXER_PRIORITY_COUNT,
+	SIGNALS_CLOCK_BLOCK_SIZE,
+	SIGNALS_CLOCK_STATUS_BASE,
 	SIGNALS_INPUT_DSP_PRIORITY_COUNT,
 	SIGNALS_PRIORITY_PATCH_LENGTH,
 	SIGNALS_PRIORITY_PATCH_OFFSET,
@@ -11,7 +16,7 @@ import {
 	SPC_HEADER,
 } from './constants.js'
 import { verifyCrc16 } from './crc16.js'
-import type { LegacyResponse, PriorityListState, SPRResponse } from './types.js'
+import type { ClockPriorityState, GainReadState, LegacyResponse, PriorityListState, SPRResponse } from './types.js'
 
 /**
  * Legacy response header size: 2 bytes (reply code + 0x00).
@@ -111,7 +116,9 @@ export function getSpecialProtocolLength(data: Buffer): number {
 }
 
 /**
- * Inactivity window (ms) used to coalesce fragmented legacy responses.
+ * Inactivity window (ms) used only for legacy responses whose size is not
+ * known by the caller. All Newton commands used by the module now select a
+ * fixed response size or SPR framing before sending.
  * Legacy responses carry no length field, so we wait for a brief gap in the
  * incoming stream before flushing the buffer to the consumer. Tuned for LAN
  * round-trip times: long enough to assemble a 1024-byte signals blob that
@@ -119,6 +126,12 @@ export function getSpecialProtocolLength(data: Buffer): number {
  * 2-byte ACKs.
  */
 const LEGACY_COALESCE_MS = 30
+// Flood guard for replies whose size is unknown. Commands that declare a
+// bigger fixed response size (e.g. the 384 KiB 0x21 audio preset) raise the
+// effective cap for their own turn via setResponseFraming.
+const MAX_ACCUMULATOR_BYTES = 64 * 1024
+
+export type ResponseFraming = 'legacyFixedLength' | 'legacyCoalesced' | 'spr'
 
 /**
  * Buffer accumulator for handling TCP stream fragmentation.
@@ -132,8 +145,21 @@ const LEGACY_COALESCE_MS = 30
  *   across multiple TCP segments.
  */
 export class MessageAccumulator {
-	private buffer: Buffer = Buffer.alloc(0)
+	private chunks: Buffer[] = []
+	private firstChunk = 0
+	private firstOffset = 0
+	private bufferedLength = 0
 	private flushTimer: ReturnType<typeof setTimeout> | null = null
+	private framing: ResponseFraming = 'legacyCoalesced'
+	private expectedLegacyLength = 0
+	// Some fixed-size legacy reads return a bare [0x66, 0x00] when the
+	// feature is unsupported. This must be explicitly enabled by the caller:
+	// raw replies can legitimately start with the same two bytes.
+	// In SPR framing, a legacy [0x33/0x66, 0x00] is accepted only as the very
+	// first reply of the turn (pre-0.98 firmware rejecting an SPC command);
+	// once real SPR bytes are seen, stray status-looking pairs stay junk.
+	private sprLegacyReplyWindow = true
+	private maxBufferedBytes = MAX_ACCUMULATOR_BYTES
 	private readonly onLegacyMessage: (data: Buffer) => void
 	private readonly onSPRMessage: (data: Buffer) => void
 
@@ -143,38 +169,120 @@ export class MessageAccumulator {
 	}
 
 	/**
+	 * Select framing for the response to the command currently in flight.
+	 * Newton's legacy TCP replies do not carry a command id or a size, so this
+	 * must be set from the transmitted command rather than guessed from the
+	 * first byte received (a raw 0x2B status packet can legitimately start F0/F1).
+	 */
+	setResponseFraming(framing: ResponseFraming, expectedLegacyLength = 0): void {
+		if (framing === 'legacyFixedLength' && (!Number.isInteger(expectedLegacyLength) || expectedLegacyLength < 1)) {
+			throw new Error('Legacy fixed-length framing requires a positive byte length')
+		}
+		this.reset()
+		this.framing = framing
+		this.expectedLegacyLength = expectedLegacyLength
+		this.sprLegacyReplyWindow = true
+		// Let declared large fixed-length replies through while keeping the
+		// small default as a flood guard for everything else.
+		this.maxBufferedBytes = Math.max(MAX_ACCUMULATOR_BYTES, expectedLegacyLength + 4096)
+	}
+
+	/**
 	 * Feed incoming data from TCP into the accumulator.
 	 * Complete messages are emitted via callbacks.
 	 */
 	feed(data: Buffer): void {
-		this.buffer = Buffer.concat([this.buffer, data])
+		if (data.length === 0) return
+		this.chunks.push(data)
+		this.bufferedLength += data.length
+		if (this.bufferedLength > this.maxBufferedBytes) {
+			// A frame larger than the declared/expected response cannot be
+			// recovered safely, so drop it.
+			this.reset()
+			return
+		}
 		this.processBuffer()
 	}
 
 	private processBuffer(): void {
-		while (this.buffer.length > 0) {
-			if (isSpecialProtocol(this.buffer)) {
-				// Cancel any pending legacy flush — a complete SPR takes priority.
+		if (this.framing === 'spr') {
+			this.processSPRBuffer()
+			return
+		}
+
+		if (this.framing === 'legacyFixedLength') {
+			// A complete documented raw reply always wins over the short-error
+			// compatibility path below.
+			if (this.bufferedLength >= this.expectedLegacyLength) {
 				this.cancelFlushTimer()
-
-				const expectedLen = getSpecialProtocolLength(this.buffer)
-				if (expectedLen < 0 || this.buffer.length < expectedLen) {
-					break // wait for more data
-				}
-
-				const message = this.buffer.subarray(0, expectedLen)
-				this.buffer = this.buffer.subarray(expectedLen)
-
-				if (message[0] === SPR_HEADER) {
-					this.onSPRMessage(Buffer.from(message))
-				}
-			} else {
-				// Legacy: coalesce — schedule a flush after a short inactivity
-				// window. Each new chunk resets the timer so multi-segment
-				// responses arrive intact.
-				this.scheduleFlush()
-				break
+				const message = this.take(this.expectedLegacyLength)
+				// The client serializes requests. Any suffix cannot be a response to a
+				// later request yet, so discard it instead of mis-associating it.
+				this.discard(this.bufferedLength)
+				this.onLegacyMessage(message)
+				return
 			}
+
+			// A rejecting firmware sends only [0x66, 0x00]; every fixed-length
+			// read accepts it so a rejection can never escalate into a timeout
+			// teardown. Wait one TCP coalescing window before accepting: a valid
+			// raw response may start with these bytes and arrive fragmented. Any
+			// additional byte before the timer expires makes it a normal
+			// fixed-size response again.
+			if (
+				this.bufferedLength === LEGACY_HEADER_SIZE &&
+				this.peek(LEGACY_HEADER_SIZE)[0] === REPLY_ERR &&
+				this.peek(LEGACY_HEADER_SIZE)[1] === 0x00
+			) {
+				this.scheduleFlush()
+				return
+			}
+
+			this.cancelFlushTimer()
+			return
+		}
+
+		// Compatibility fallback for callers that truly do not know the reply
+		// size. This is deliberately never selected from the data itself.
+		this.scheduleFlush()
+	}
+
+	private processSPRBuffer(): void {
+		while (this.bufferedLength > 0) {
+			// Firmware without Special Protocol support (< 0.98) answers an SPC
+			// request with a plain legacy [0x33/0x66, 0x00] status. Surface it as
+			// a legacy message so the in-flight command resolves as a rejection
+			// instead of timing out (a timeout tears down the connection by design).
+			const first = this.peek(1)[0]
+			if (this.sprLegacyReplyWindow && (first === REPLY_OK || first === REPLY_ERR)) {
+				if (this.bufferedLength < LEGACY_HEADER_SIZE) return
+				if (this.peek(LEGACY_HEADER_SIZE)[1] === 0x00) {
+					this.onLegacyMessage(this.take(LEGACY_HEADER_SIZE))
+					continue
+				}
+			}
+			this.sprLegacyReplyWindow = false
+			const headerOffset = this.indexOf(SPR_HEADER)
+			if (headerOffset < 0) {
+				this.discard(this.bufferedLength)
+				return
+			}
+			if (headerOffset > 0) {
+				this.discard(headerOffset)
+			}
+			if (this.bufferedLength < 6) return
+
+			const expectedLen = getSpecialProtocolLength(this.peek(6))
+			const minFrameLen = SPR_HEADER_SIZE + SPR_CRC_SIZE
+			if (expectedLen < minFrameLen || expectedLen > MAX_ACCUMULATOR_BYTES) {
+				// Corrupt length: advance one byte and search for the next SPR header.
+				this.discard(1)
+				continue
+			}
+			if (this.bufferedLength < expectedLen) return
+
+			const message = this.take(expectedLen)
+			this.onSPRMessage(message)
 		}
 	}
 
@@ -194,10 +302,8 @@ export class MessageAccumulator {
 	}
 
 	private flushLegacy(): void {
-		if (this.buffer.length === 0) return
-		const message = this.buffer
-		this.buffer = Buffer.alloc(0)
-		this.onLegacyMessage(Buffer.from(message))
+		if (this.bufferedLength === 0) return
+		this.onLegacyMessage(this.take(this.bufferedLength))
 	}
 
 	/**
@@ -205,19 +311,69 @@ export class MessageAccumulator {
 	 */
 	reset(): void {
 		this.cancelFlushTimer()
-		this.buffer = Buffer.alloc(0)
+		this.chunks = []
+		this.firstChunk = 0
+		this.firstOffset = 0
+		this.bufferedLength = 0
 	}
-}
 
-/**
- * Parse the response to a ReadPreset command (0x08).
- * Response: [0x33, 0x00, presetNumber] on success (3 bytes).
- */
-export function parseReadPresetResponse(data: Buffer): number | null {
-	if (data.length < LEGACY_HEADER_SIZE) return null
-	if (data[0] !== REPLY_OK) return null
-	if (data.length < LEGACY_HEADER_SIZE + 1) return null
-	return data[LEGACY_HEADER_SIZE]
+	private indexOf(byte: number): number {
+		let offset = 0
+		for (let i = this.firstChunk; i < this.chunks.length; i++) {
+			const chunk = this.chunks[i]
+			const chunkOffset = i === this.firstChunk ? this.firstOffset : 0
+			const found = chunk.indexOf(byte, chunkOffset)
+			if (found >= 0) return offset + found - chunkOffset
+			offset += chunk.length - chunkOffset
+		}
+		return -1
+	}
+
+	private peek(length: number): Buffer {
+		if (length > this.bufferedLength) throw new RangeError('Cannot peek beyond accumulated data')
+		const result = Buffer.allocUnsafe(length)
+		let copied = 0
+		for (let i = this.firstChunk; copied < length; i++) {
+			const chunk = this.chunks[i]
+			const chunkOffset = i === this.firstChunk ? this.firstOffset : 0
+			const count = Math.min(length - copied, chunk.length - chunkOffset)
+			chunk.copy(result, copied, chunkOffset, chunkOffset + count)
+			copied += count
+		}
+		return result
+	}
+
+	private take(length: number): Buffer {
+		const result = this.peek(length)
+		this.discard(length)
+		return result
+	}
+
+	private discard(length: number): void {
+		if (length < 0 || length > this.bufferedLength) throw new RangeError('Cannot discard beyond accumulated data')
+		let remaining = length
+		while (remaining > 0) {
+			const chunk = this.chunks[this.firstChunk]
+			const available = chunk.length - this.firstOffset
+			if (remaining < available) {
+				this.firstOffset += remaining
+				remaining = 0
+			} else {
+				remaining -= available
+				this.firstChunk++
+				this.firstOffset = 0
+			}
+		}
+		this.bufferedLength -= length
+		if (this.bufferedLength === 0) {
+			this.chunks = []
+			this.firstChunk = 0
+			this.firstOffset = 0
+		} else if (this.firstChunk > 128 && this.firstChunk * 2 >= this.chunks.length) {
+			this.chunks = this.chunks.slice(this.firstChunk)
+			this.firstChunk = 0
+		}
+	}
 }
 
 /**
@@ -246,6 +402,25 @@ export function parseImportDescriptionResponse(data: Buffer): string | null {
  */
 export function parseImportFirmwareResponse(data: Buffer): string | null {
 	return parseLegacyString(data)
+}
+
+/**
+ * Compare a device firmware string (e.g. "0.97", "1.0.2") against a minimum
+ * version. Numeric segments are compared left to right; missing segments
+ * count as 0. Returns null when either string carries no numeric segment, so
+ * callers can fall back to probing the feature instead of guessing.
+ */
+export function isFirmwareAtLeast(version: string, minimum: string): boolean | null {
+	const parse = (value: string): number[] | null => value.match(/\d+/g)?.map(Number) ?? null
+	const have = parse(version)
+	const want = parse(minimum)
+	if (!have || !want) return null
+	for (let i = 0; i < Math.max(have.length, want.length); i++) {
+		const a = have[i] ?? 0
+		const b = want[i] ?? 0
+		if (a !== b) return a > b
+	}
+	return true
 }
 
 /**
@@ -318,4 +493,84 @@ export function parsePriorityListResponse(data: Buffer): PriorityListState | nul
 		isForced: payload[4] !== 0,
 		forcedChannel: payload[5] ?? -1,
 	}
+}
+
+/**
+ * Parse a Get Processing Clock (0x81) response: 19 bytes
+ * [0-15] priority list, [16] isForced, [17] forced index, [18] is48.
+ * Accepts both the raw 19-byte body and the [0x33,0x00]-prefixed form.
+ */
+export function parseClockStateResponse(data: Buffer): ClockPriorityState | null {
+	const bodyLength = CLOCK_LIST_LENGTH + 3
+	const payload =
+		data.length >= LEGACY_HEADER_SIZE + bodyLength && data[0] === REPLY_OK
+			? data.subarray(LEGACY_HEADER_SIZE, LEGACY_HEADER_SIZE + bodyLength)
+			: data.length >= bodyLength
+				? data.subarray(0, bodyLength)
+				: null
+
+	if (!payload) return null
+
+	return {
+		list: Array.from(payload.subarray(0, CLOCK_LIST_LENGTH)),
+		isForced: payload[CLOCK_LIST_LENGTH] !== 0,
+		forcedIndex: payload[CLOCK_LIST_LENGTH + 1],
+		is48: payload[CLOCK_LIST_LENGTH + 2] !== 0,
+	}
+}
+
+// ===== 0x21 audio preset blob =====
+// The preset is 393216 bytes; the 0x21 response prefixes it with [0x33, 0x00].
+// Gain block: 458 entries of 5 bytes (float32 LE dB + mute byte) at preset
+// offset 1008, ordered by Channel Type: 16 InputDsp, 16 OutputDsp, 10 AuxMixer
+// (8 ch + 2 masters), 288 MatrixMixer, 64 Trimmer, 64 OutputGroup = 458.
+export const PRESET_AUDIO_SIZE = 393216
+export const PRESET_AUDIO_RESPONSE_LENGTH = LEGACY_HEADER_SIZE + PRESET_AUDIO_SIZE
+const PRESET_GAIN_OFFSET = 1008
+const PRESET_GAIN_STRIDE = 5
+const PRESET_GAIN_INPUT_BASE = 0
+const PRESET_GAIN_OUTPUT_BASE = 16
+
+export interface PresetAudioGains {
+	/** Gain+mute per Input DSP channel 0-15 (null when the float is invalid). */
+	inputDsp: (GainReadState | null)[]
+	/** Gain+mute per Output DSP channel 0-15 (null when the float is invalid). */
+	outputDsp: (GainReadState | null)[]
+}
+
+/** Extract the Input/Output DSP gain+mute banks from a 0x21 response. */
+export function parsePresetAudioGains(data: Buffer): PresetAudioGains | null {
+	const gainBase = LEGACY_HEADER_SIZE + PRESET_GAIN_OFFSET
+	const needed = gainBase + (PRESET_GAIN_OUTPUT_BASE + 16) * PRESET_GAIN_STRIDE
+	if (data.length < needed || data[0] !== REPLY_OK) return null
+
+	const readEntry = (entryIndex: number): GainReadState | null => {
+		const offset = gainBase + entryIndex * PRESET_GAIN_STRIDE
+		const gainDb = data.readFloatLE(offset)
+		if (!Number.isFinite(gainDb)) return null
+		return { gainDb, muted: data[offset + 4] !== 0 }
+	}
+
+	const inputDsp: (GainReadState | null)[] = []
+	const outputDsp: (GainReadState | null)[] = []
+	for (let i = 0; i < 16; i++) {
+		inputDsp.push(readEntry(PRESET_GAIN_INPUT_BASE + i))
+		outputDsp.push(readEntry(PRESET_GAIN_OUTPUT_BASE + i))
+	}
+	return { inputDsp, outputDsp }
+}
+
+/**
+ * Extract the definitive clock source per clock type from the 0x2B blob:
+ * bytes 631 (Master), 648 (WC Out 1) and 665 (WC Out 2) hold the selected
+ * Clock List value post-backup.
+ */
+export function parseClockSelected(data: Buffer): number[] | null {
+	const needed = SIGNALS_CLOCK_STATUS_BASE + SIGNALS_CLOCK_BLOCK_SIZE * CLOCK_TYPE_COUNT
+	if (data.length < needed) return null
+	const selected: number[] = []
+	for (let type = 0; type < CLOCK_TYPE_COUNT; type++) {
+		selected.push(data[SIGNALS_CLOCK_STATUS_BASE + type * SIGNALS_CLOCK_BLOCK_SIZE + (SIGNALS_CLOCK_BLOCK_SIZE - 1)])
+	}
+	return selected
 }

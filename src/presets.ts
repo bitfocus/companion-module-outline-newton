@@ -1,79 +1,12 @@
 import { combineRgb, type CompanionPresetDefinitions } from '@companion-module/base'
+import { UI } from './style.js'
 
 export function getPresetDefinitions(): CompanionPresetDefinitions {
 	const presets: CompanionPresetDefinitions = {}
 
-	// ===== Mute / Unmute (Input DSP Ch0) =====
-	presets['mute_on'] = {
-		type: 'button',
-		category: 'Mute',
-		name: 'Mute Input Ch0',
-		style: {
-			text: 'MUTE\\nIN 0',
-			size: '14',
-			color: combineRgb(255, 255, 255),
-			bgcolor: combineRgb(255, 0, 0),
-		},
-		steps: [
-			{
-				down: [{ actionId: 'set_mute', options: { channelType: 0, channelIndex: 0, gainDb: 0, mute: 1 } }],
-				up: [],
-			},
-		],
-		feedbacks: [],
-	}
-
-	presets['mute_off'] = {
-		type: 'button',
-		category: 'Mute',
-		name: 'Unmute Input Ch0',
-		style: {
-			text: 'UNMUTE\\nIN 0',
-			size: '14',
-			color: combineRgb(255, 255, 255),
-			bgcolor: combineRgb(0, 100, 0),
-		},
-		steps: [
-			{
-				down: [{ actionId: 'set_mute', options: { channelType: 0, channelIndex: 0, gainDb: 0, mute: 0 } }],
-				up: [],
-			},
-		],
-		feedbacks: [],
-	}
-
-	// ===== Preset Recall Buttons (0-7) =====
-	for (let i = 0; i < 8; i++) {
-		presets[`preset_${i}`] = {
-			type: 'button',
-			category: 'Presets',
-			name: `Preset ${i}`,
-			style: {
-				text: `PRESET\\n${i}`,
-				size: '14',
-				color: combineRgb(255, 255, 255),
-				bgcolor: combineRgb(0, 0, 100),
-			},
-			steps: [
-				{
-					down: [{ actionId: 'change_preset', options: { preset: i } }],
-					up: [],
-				},
-			],
-			feedbacks: [
-				{
-					feedbackId: 'preset_active',
-					options: { preset: i },
-					style: {
-						bgcolor: combineRgb(0, 128, 0),
-						color: combineRgb(255, 255, 255),
-					},
-				},
-			],
-		}
-	}
-
 	// ===== Connection Status =====
+	// The advanced feedback colors the button itself (green connected / red
+	// not connected): no layered style overrides to configure.
 	presets['connection'] = {
 		type: 'button',
 		category: 'Status',
@@ -82,7 +15,7 @@ export function getPresetDefinitions(): CompanionPresetDefinitions {
 			text: '$(outline-newton:connection_state)',
 			size: '14',
 			color: combineRgb(255, 255, 255),
-			bgcolor: combineRgb(100, 0, 0),
+			bgcolor: UI.bgNeutral,
 		},
 		steps: [
 			{
@@ -92,134 +25,268 @@ export function getPresetDefinitions(): CompanionPresetDefinitions {
 		],
 		feedbacks: [
 			{
-				feedbackId: 'connection_status',
+				feedbackId: 'connection_monitor',
 				options: {},
-				style: {
-					bgcolor: combineRgb(0, 128, 0),
-					color: combineRgb(255, 255, 255),
-				},
 			},
 		],
 	}
 
-	// ===== Priority Patch Operator Buttons =====
-	for (let i = 0; i < 16; i++) {
-		presets[`priority_input_${i}_status`] = {
-			type: 'button',
-			category: 'Priority Patch',
-			name: `Input Priority ${i} Status`,
-			style: {
-				text: `IN PRI ${i}\\n$(outline-newton:priority_in_${i})`,
-				size: '14',
-				color: combineRgb(255, 255, 255),
-				bgcolor: combineRgb(40, 40, 40),
-			},
-			steps: [{ down: [], up: [] }],
-			feedbacks: [
-				{
-					feedbackId: 'priority_overridden',
-					options: { channelType: 0, patchIndex: i, highestSource: i },
-					style: {
-						bgcolor: combineRgb(200, 100, 0),
-						color: combineRgb(255, 255, 255),
-					},
-				},
-			],
-		}
-
-		presets[`priority_input_${i}_rearm`] = {
-			type: 'button',
-			category: 'Priority Patch',
-			name: `Rearm Input Priority ${i}`,
-			style: {
-				text: `REARM\\nIN PRI ${i}`,
-				size: '14',
-				color: combineRgb(255, 255, 255),
-				bgcolor: combineRgb(90, 60, 0),
-			},
-			steps: [
-				{
-					down: [{ actionId: 'rearm_priority', options: { channelType: 0, channelIndex: i } }],
-					up: [],
-				},
-			],
-			feedbacks: [],
-		}
-	}
-
-	for (let i = 0; i < 8; i++) {
-		presets[`priority_aux_${i}_status`] = {
-			type: 'button',
-			category: 'Priority Patch',
-			name: `Aux Priority ${i} Status`,
-			style: {
-				text: `AUX PRI ${i}\\n$(outline-newton:priority_aux_${i})`,
-				size: '14',
-				color: combineRgb(255, 255, 255),
-				bgcolor: combineRgb(40, 40, 40),
-			},
-			steps: [{ down: [], up: [] }],
-			feedbacks: [
-				{
-					feedbackId: 'priority_overridden',
-					options: { channelType: 6, patchIndex: i, highestSource: i },
-					style: {
-						bgcolor: combineRgb(200, 100, 0),
-						color: combineRgb(255, 255, 255),
-					},
-				},
-			],
-		}
-
-		presets[`priority_aux_${i}_rearm`] = {
-			type: 'button',
-			category: 'Priority Patch',
-			name: `Rearm Aux Priority ${i}`,
-			style: {
-				text: `REARM\\nAUX PRI ${i}`,
-				size: '14',
-				color: combineRgb(255, 255, 255),
-				bgcolor: combineRgb(90, 60, 0),
-			},
-			steps: [
-				{
-					down: [{ actionId: 'rearm_priority', options: { channelType: 6, channelIndex: i } }],
-					up: [],
-				},
-			],
-			feedbacks: [],
-		}
-	}
-
-	presets['selected_priority_status'] = {
+	// ===== Input patch (Hardware-to-Logic priority) =====
+	// One template button per function. The monitor feedback takes a single
+	// input number (1-16) and drives everything itself: it replaces the
+	// '#channel' placeholder text with "IN <n>" and colors the button from the
+	// device state (0x2B active source vs 0x91 channel list).
+	presets['priority_input_monitor'] = {
 		type: 'button',
-		category: 'Priority Patch',
-		name: 'Selected Priority Status',
+		category: 'Input patch',
+		name: 'Monitor Input',
 		style: {
-			text: 'PRI SEL\\n$(outline-newton:priority_selected_active)',
+			text: 'IN\\n#channel',
 			size: '14',
 			color: combineRgb(255, 255, 255),
-			bgcolor: combineRgb(40, 40, 40),
+			bgcolor: UI.bgNeutral,
 		},
 		steps: [{ down: [], up: [] }],
 		feedbacks: [
 			{
-				feedbackId: 'priority_backup_active',
-				options: {},
-				style: {
-					bgcolor: combineRgb(200, 100, 0),
-					color: combineRgb(255, 255, 255),
-				},
-			},
-			{
-				feedbackId: 'priority_manual_forced',
-				options: {},
-				style: {
-					bgcolor: combineRgb(120, 70, 180),
-					color: combineRgb(255, 255, 255),
-				},
+				feedbackId: 'input_patch_monitor',
+				options: { patchIndex: 1 },
 			},
 		],
+	}
+
+	// The rearm label feedback carries the single input number: it writes
+	// "REARM IN <n>" on the button and feeds the 'rearm_this_input' action.
+	presets['priority_input_rearm'] = {
+		type: 'button',
+		category: 'Input patch',
+		name: 'Rearm Input',
+		style: {
+			text: 'REARM\\n#channel',
+			size: '14',
+			color: combineRgb(255, 255, 255),
+			bgcolor: UI.blue,
+		},
+		steps: [
+			{
+				down: [{ actionId: 'rearm_this_input', options: {} }],
+				up: [],
+			},
+		],
+		feedbacks: [
+			{
+				feedbackId: 'input_patch_rearm_label',
+				options: { patchIndex: 1 },
+			},
+		],
+	}
+
+	// ===== Clock =====
+	// Same pattern as Input patch: the monitor feedback and the rearm label
+	// feedback each take one clock selection (Master / WC Out 1 / WC Out 2)
+	// and drive the whole button, label included.
+	presets['clock_monitor'] = {
+		type: 'button',
+		category: 'Clock',
+		name: 'Monitor Clock',
+		style: {
+			text: 'CLOCK',
+			size: '14',
+			color: combineRgb(255, 255, 255),
+			bgcolor: UI.bgNeutral,
+		},
+		steps: [{ down: [], up: [] }],
+		feedbacks: [
+			{
+				feedbackId: 'clock_monitor',
+				options: { clockType: 0 },
+			},
+		],
+	}
+
+	presets['clock_rearm'] = {
+		type: 'button',
+		category: 'Clock',
+		name: 'Rearm Clock',
+		style: {
+			text: 'REARM\\nCLOCK',
+			size: '14',
+			color: combineRgb(255, 255, 255),
+			bgcolor: UI.blue,
+		},
+		steps: [
+			{
+				down: [{ actionId: 'rearm_this_clock', options: {} }],
+				up: [],
+			},
+		],
+		feedbacks: [
+			{
+				feedbackId: 'clock_rearm_label',
+				options: { clockType: 0 },
+			},
+		],
+	}
+
+	// ===== Levels & Mute =====
+	// Each button monitors one channel: set the channel type and number in the
+	// feedback options. The gain button shows the live dB value; the mute button
+	// turns red when muted, green when open. Their state comes from preset audio.
+	presets['channel_gain'] = {
+		type: 'button',
+		category: 'Levels & Mute',
+		name: 'Channel Gain',
+		style: {
+			text: 'GAIN\\n#channel',
+			size: 'auto',
+			color: combineRgb(255, 255, 255),
+			bgcolor: UI.bgNeutral,
+		},
+		steps: [{ down: [], up: [] }],
+		feedbacks: [
+			{
+				feedbackId: 'channel_gain',
+				options: { channelType: 0, channel: 1 },
+			},
+		],
+	}
+
+	// Level trim buttons: pick channel type, channel and the dB step in the
+	// action options. The write preserves mute and re-reads the device value,
+	// so any Channel Gain button on the same channel refreshes immediately.
+	presets['level_up'] = {
+		type: 'button',
+		category: 'Levels & Mute',
+		name: 'Level Up',
+		style: {
+			text: 'LEVEL\\n+',
+			size: '18',
+			color: combineRgb(255, 255, 255),
+			bgcolor: UI.bgPanel,
+		},
+		steps: [
+			{
+				down: [{ actionId: 'adjust_gain', options: { channelType: 0, channel: 1, direction: 'up', deltaDb: 1 } }],
+				up: [],
+			},
+		],
+		feedbacks: [],
+	}
+
+	presets['level_down'] = {
+		type: 'button',
+		category: 'Levels & Mute',
+		name: 'Level Down',
+		style: {
+			text: 'LEVEL\\n-',
+			size: '18',
+			color: combineRgb(255, 255, 255),
+			bgcolor: UI.bgPanel,
+		},
+		steps: [
+			{
+				down: [{ actionId: 'adjust_gain', options: { channelType: 0, channel: 1, direction: 'down', deltaDb: 1 } }],
+				up: [],
+			},
+		],
+		feedbacks: [],
+	}
+
+	// Mute key: one pair of options (type + channel) in the feedback drives the
+	// state color AND tells the press action which channel to toggle.
+	presets['channel_mute'] = {
+		type: 'button',
+		category: 'Levels & Mute',
+		name: 'Channel Mute',
+		style: {
+			text: 'TOGGLE MUTE\\n#channel',
+			size: 'auto',
+			color: combineRgb(255, 255, 255),
+			bgcolor: UI.bgNeutral,
+		},
+		steps: [
+			{
+				down: [{ actionId: 'mute_this_channel', options: { mode: 'toggle' } }],
+				up: [],
+			},
+		],
+		feedbacks: [
+			{
+				feedbackId: 'channel_mute',
+				options: { channelType: 0, channel: 1 },
+			},
+		],
+	}
+
+	// ===== Snapshots =====
+	// The label feedback carries the snapshot selection (by name, read live
+	// from the device database): it writes the snapshot name on the button and
+	// feeds the 'apply_this_snapshot' action.
+	presets['snapshot_apply'] = {
+		type: 'button',
+		category: 'Snapshots',
+		name: 'Apply Snapshot',
+		style: {
+			text: 'APPLY\\n#snapshot',
+			size: 'auto',
+			color: combineRgb(255, 255, 255),
+			bgcolor: UI.indigo,
+		},
+		steps: [
+			{
+				down: [{ actionId: 'apply_this_snapshot', options: { fadingTime: 2000, mode: 'Direct' } }],
+				up: [],
+			},
+		],
+		feedbacks: [
+			{
+				feedbackId: 'snapshot_apply_label',
+				options: { uuid: '' },
+			},
+		],
+	}
+
+	// ===== Metering =====
+	// The meter feedback draws the whole button: black background with the
+	// red/orange/green/blue gradient revealed by the live level.
+	presets['meter'] = {
+		type: 'button',
+		category: 'Metering',
+		name: 'Meter',
+		style: {
+			text: '',
+			size: '14',
+			color: combineRgb(255, 255, 255),
+			bgcolor: combineRgb(0, 0, 0),
+			// The drawn VU meter uses the full button height.
+			show_topbar: false,
+		},
+		steps: [{ down: [], up: [] }],
+		feedbacks: [
+			{
+				feedbackId: 'meter',
+				options: { meterType: 0, meterMode: 'rms', channel: 1 },
+			},
+		],
+	}
+
+	presets['priority_rearm_all'] = {
+		type: 'button',
+		category: 'Input patch',
+		name: 'Rearm All Inputs',
+		style: {
+			text: 'REARM\\nALL',
+			size: '14',
+			color: combineRgb(255, 255, 255),
+			bgcolor: UI.blue,
+		},
+		steps: [
+			{
+				down: [{ actionId: 'rearm_all_inputs', options: {} }],
+				up: [],
+			},
+		],
+		feedbacks: [],
 	}
 
 	return presets

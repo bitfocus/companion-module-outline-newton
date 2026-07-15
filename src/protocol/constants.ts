@@ -1,12 +1,12 @@
 // ===== Network Ports =====
-export const PORT_UDP = 6666 // Scansione progetto iniziale UDP
-export const PORT_METERS = 6667 // VU-meters UDP
-export const PORT_TCP = 6668 // Porta principale per i comandi TCP
-export const PORT_BROADCAST = 6669 // Porta per le notifiche broadcast UDP
-export const PORT_UDP_COMMAND = 6670 // Porta secondaria per i comandi UDP
-export const PORT_STATUS = 6671 // Status UDP
+export const PORT_UDP = 6666 // Legacy UDP discovery
+export const PORT_METERS = 6667 // Newton UDP meter/status server
+export const PORT_TCP = 6668 // Newton TCP control server
+export const PORT_BROADCAST = 6669 // UDP broadcast notifications
+export const PORT_UDP_COMMAND = 6670 // Secondary UDP command server
+export const PORT_STATUS = 6671 // UDP status server
 
-// ===== Legacy Command IDs (primo byte del messaggio) =====
+// ===== Legacy Command IDs (first message byte) =====
 export enum LegacyCmd {
 	Gain = 0x01,
 	Delay = 0x02,
@@ -15,7 +15,6 @@ export enum LegacyCmd {
 	LimiterPseudoPeak = 0x05,
 	Mute = 0x06,
 	Polarity = 0x07,
-	ReadPreset = 0x08,
 	MatrixAssign = 0x09,
 	StorePreset = 0x0a,
 	Pan = 0x0b,
@@ -66,9 +65,46 @@ export enum LegacyCmd {
 	GetAes3 = 0x4a,
 	SetFan = 0x4b,
 	GetFan = 0x4c,
+	SetProcessingClock = 0x80,
+	GetProcessingClock = 0x81,
 	RearmPriority = 0x90,
 	ReadPriorityList = 0x91,
 }
+
+// ===== Processing clock (0x80/0x81) =====
+export enum ClockType {
+	Master = 0x00,
+	WordClockOut1 = 0x01,
+	WordClockOut2 = 0x02,
+}
+export const CLOCK_TYPE_COUNT = 3
+export const CLOCK_LIST_LENGTH = 16
+
+/** Documented Clock List source names, index = protocol clock value 0-15. */
+export const CLOCK_SOURCE_NAMES = [
+	'INT24',
+	'INT22',
+	'WC',
+	'AES 1-2',
+	'AES 3-4',
+	'AES 5-6',
+	'AES 7-8',
+	'AES 9-10',
+	'AES 11-12',
+	'AES 13-14',
+	'AES 15-16',
+	'MADI CX',
+	'MADI OPT',
+	'DANTE',
+	'VSYNC',
+	'NONE',
+] as const
+
+// 0x2B blob: per-clock-type blocks of 16 status bytes + 1 "selected" byte,
+// Master at 615, Word Clock Out 1 at 632, Word Clock Out 2 at 649. The
+// selected byte (base+16) holds the definitive Clock List value post-backup.
+export const SIGNALS_CLOCK_STATUS_BASE = 615
+export const SIGNALS_CLOCK_BLOCK_SIZE = 17
 
 // Offset within the 0x2B (ImportSignals) response where the priority patch
 // state lives: 24 bytes = 16 InputDsp + 8 AuxMixer; each byte is the currently
@@ -96,6 +132,27 @@ export enum SnapshotCmd {
 	Clone = 0x000a,
 }
 
+/**
+ * First firmware with the snapshot command set. Older firmware (e.g. 0.97)
+ * answers any snapshot SPC request with a plain legacy [0x66, 0x00] error.
+ */
+export const MIN_SNAPSHOT_FIRMWARE = '0.98'
+
+/**
+ * Device-safety gain window: every gain written to the device is clamped to
+ * [-80, +6] dB as a PA-safety net — values outside this range must never
+ * reach the wire, whatever their source (operator input, cached device
+ * reads, trigger expressions).
+ */
+export const GAIN_MIN_DB = -80
+export const GAIN_MAX_DB = 6
+
+/** Clamp a dB gain to the device-safe write range; non-finite input floors to GAIN_MIN_DB. */
+export function clampGainDb(gainDb: number): number {
+	if (!Number.isFinite(gainDb)) return GAIN_MIN_DB
+	return Math.min(GAIN_MAX_DB, Math.max(GAIN_MIN_DB, gainDb))
+}
+
 // ===== Reply Codes =====
 export const REPLY_OK = 0x33
 export const REPLY_ERR = 0x66
@@ -106,12 +163,10 @@ export const SPR_WERR = 0x6600
 export enum ChannelType {
 	InputDsp = 0x00,
 	OutputDsp = 0x01,
-	InputPatch = 0x02,
-	OutputPatch = 0x03,
-	Group = 0x04,
-	Trimmer = 0x05,
-	AuxMixer = 0x06,
-	Matrix = 0x07,
+	AuxMixer = 0x02,
+	MatrixMixer = 0x03,
+	Trimmer = 0x04,
+	OutputGroup = 0x05,
 }
 
 // ===== Snapshot Apply Modes =====
