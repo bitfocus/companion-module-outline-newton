@@ -1,4 +1,5 @@
 import type { CompanionActionDefinitions, InstanceBase } from '@companion-module/base'
+import { presetAudioReadOptions } from './preset-audio.js'
 import {
 	ChannelType,
 	ClockType,
@@ -11,6 +12,7 @@ import {
 import {
 	buildGainCommand,
 	buildGetClockCommand,
+	buildImportAudioPresetCommand,
 	buildReadPriorityListCommand,
 	buildRearmClockCommand,
 	buildRearmPriorityCommand,
@@ -20,13 +22,23 @@ import {
 import { parseClockStateResponse, parsePriorityListResponse } from './protocol/command-parser.js'
 import { findSnapshot, snapshotPlaceholderLabel } from './snapshots.js'
 import type { NewtonActionResult } from './protocol/types.js'
-import type { NewtonTcpClient } from './protocol/tcp-client.js'
+import type { SendCommandExpectOptions } from './protocol/tcp-client.js'
 import type { ClockPriorityState, GainReadState, PriorityListState, SnapshotInfo } from './protocol/types.js'
+import type { NewtonActionClient } from './action-client.js'
 
 type Logger = Pick<InstanceBase<never>, 'log'> & {
 	reportActionResult?: (result: NewtonActionResult) => void
 	/** Fresh confirmed state after a write: refreshes matching gain/mute buttons at once. */
 	reportGainRead?: (channelType: number, channelIndex: number, state: GainReadState) => void
+}
+
+// Action feedback variables are IPC-visible strings. Never turn a large SPR
+// payload (for example a snapshot database) into an unbounded hex variable.
+const MAX_ACTION_RESPONSE_HEX_BYTES = 128
+
+function formatActionResponseHex(data: Buffer): string {
+	if (data.length <= MAX_ACTION_RESPONSE_HEX_BYTES) return data.toString('hex')
+	return `${data.subarray(0, MAX_ACTION_RESPONSE_HEX_BYTES).toString('hex')}… (${data.length} bytes total)`
 }
 
 function reportActionFailure(logger: Logger, name: string, error: string, controlId?: string): void {
@@ -52,13 +64,31 @@ const VALID_CHANNEL_TYPES = new Set<number>([
 	Number(ChannelType.OutputGroup),
 ])
 
+/** Number of addressable channels in each documented Gain command bank. */
+const CHANNEL_TYPE_CHANNEL_COUNTS: Readonly<Record<ChannelType, number>> = {
+	[ChannelType.InputDsp]: 16,
+	[ChannelType.OutputDsp]: 16,
+	[ChannelType.AuxMixer]: 10,
+	[ChannelType.MatrixMixer]: 288,
+	[ChannelType.Trimmer]: 64,
+	[ChannelType.OutputGroup]: 64,
+}
+
+function channelCountForType(channelType: ChannelType): number {
+	return CHANNEL_TYPE_CHANNEL_COUNTS[channelType]
+}
+
+function isGainReadChannelType(channelType: number): channelType is ChannelType.InputDsp | ChannelType.OutputDsp {
+	return channelType === Number(ChannelType.InputDsp) || channelType === Number(ChannelType.OutputDsp)
+}
+
 async function runCommand(
-	client: NewtonTcpClient,
+	client: NewtonActionClient,
 	logger: Logger,
 	name: string,
 	cmd: Buffer,
 	controlId?: string,
-	options: Parameters<NewtonTcpClient['sendCommandExpect']>[1] = {},
+	options: SendCommandExpectOptions = {},
 ): Promise<boolean> {
 	// Keep action callbacks thin: command builders own wire layout, while the
 	// TCP client owns queuing, timeout handling, response parsing, and logging.
@@ -67,7 +97,7 @@ async function runCommand(
 		logger.reportActionResult?.({
 			name,
 			success: result.success,
-			responseHex: result.rx.toString('hex'),
+			responseHex: formatActionResponseHex(result.rx),
 			error: result.error,
 			controlId,
 		})
@@ -81,12 +111,12 @@ async function runCommand(
 }
 
 async function buildAndRunCommand(
-	client: NewtonTcpClient,
+	client: NewtonActionClient,
 	logger: Logger,
 	name: string,
 	build: () => Buffer,
 	controlId?: string,
-	options: Parameters<NewtonTcpClient['sendCommandExpect']>[1] = {},
+	options: SendCommandExpectOptions = {},
 ): Promise<boolean> {
 	try {
 		return await runCommand(client, logger, name, build(), controlId, options)
@@ -106,8 +136,19 @@ function validChannelType(value: unknown, logger: Logger, actionName: string, co
 	return channelType
 }
 
+function validSnapshotApplyMode(
+	value: unknown,
+	logger: Logger,
+	actionName: string,
+	controlId?: string,
+): SnapshotApplyMode | null {
+	if (value === SnapshotApplyMode.Direct || value === SnapshotApplyMode.ThroughZero) return value
+	reportActionFailure(logger, actionName, 'transition mode must be Direct or Through Zero', controlId)
+	return null
+}
+
 async function readPriorityList(
-	client: NewtonTcpClient,
+	client: NewtonActionClient,
 	logger: Logger,
 	channelIndex: number,
 	controlId?: string,
@@ -124,7 +165,7 @@ async function readPriorityList(
 			logger.reportActionResult?.({
 				name: 'Read Priority List',
 				success: true,
-				responseHex: result.rx.toString('hex'),
+				responseHex: formatActionResponseHex(result.rx),
 				controlId,
 			})
 			return result.parsed
@@ -133,7 +174,7 @@ async function readPriorityList(
 		logger.reportActionResult?.({
 			name: 'Read Priority List',
 			success: false,
-			responseHex: result.rx.toString('hex'),
+			responseHex: formatActionResponseHex(result.rx),
 			error,
 			controlId,
 		})
@@ -146,53 +187,51 @@ async function readPriorityList(
 }
 
 /**
- * Provider of the last known gain/mute of a channel, fed by the preset-audio
- * poll while at least one Levels & Mute feedback is visible in Companion.
+ * Provider retained for the module wiring and feedback cache. Read-modify-write
+ * actions deliberately do not use it: they obtain a fresh 0x21 state first.
  */
 export type GainReadProvider = (channelType: number, channelIndex: number) => GainReadState | undefined
 
 /**
- * Set/toggle the mute of one channel, preserving the last known gain. The
- * write is reported only after the device ACKs it, then the next preset-audio
- * poll confirms (or corrects) the device state.
+ * Read one Input/Output gain state from the full 0x21 audio-preset response.
+ * Newton firmware 0.98 rejects Get Gain (0x01), so this is the only reliable
+ * read before a gain/mute read-modify-write operation.
  */
-async function applyChannelMute(
-	client: NewtonTcpClient,
+async function readFreshGainState(
+	client: NewtonActionClient,
 	logger: Logger,
 	name: string,
-	channelType: number,
+	channelType: ChannelType.InputDsp | ChannelType.OutputDsp,
 	channelIndex: number,
-	mode: 'mute' | 'unmute' | 'toggle',
-	getGainRead: GainReadProvider,
-	controlId?: string,
-): Promise<void> {
-	const current = getGainRead(channelType, channelIndex)
-	if (!current) {
-		reportActionFailure(
-			logger,
-			name,
-			'current gain/mute not read from the device yet (preset-audio polling); retry in a moment',
-			controlId,
-		)
-		return
+): Promise<GainReadState | null> {
+	try {
+		const result = await client.sendCommandExpect(buildImportAudioPresetCommand(), presetAudioReadOptions())
+		if (!result.success || !result.parsed) {
+			logger.log(
+				'warn',
+				`${name}: unable to read current gain/mute: ${result.error ?? 'invalid audio preset response'}`,
+			)
+			return null
+		}
+		const current =
+			channelType === ChannelType.InputDsp
+				? result.parsed.inputDsp[channelIndex]
+				: result.parsed.outputDsp[channelIndex]
+		if (!current) {
+			logger.log('warn', `${name}: requested channel has no valid gain/mute state in the audio preset`)
+			return null
+		}
+		logger.reportGainRead?.(channelType, channelIndex, current)
+		return current
+	} catch (err) {
+		logger.log('warn', `${name}: unable to read current gain/mute: ${err instanceof Error ? err.message : String(err)}`)
+		return null
 	}
-	const mute = mode === 'toggle' ? !current.muted : mode === 'mute'
-	// The cached gain comes from the device and may sit outside the safe write
-	// window: clamp it rather than echoing an out-of-range value back.
-	const gainDb = clampGainDb(current.gainDb)
-	const written = await buildAndRunCommand(
-		client,
-		logger,
-		name,
-		() => buildGainCommand({ channelType, channelIndex, gainDb, mute }),
-		controlId,
-	)
-	if (written) logger.reportGainRead?.(channelType, channelIndex, { gainDb, muted: mute })
 }
 
 /** Read the current list, then rearm the patch from slot 0, preserving state. */
 async function rearmInput(
-	client: NewtonTcpClient,
+	client: NewtonActionClient,
 	logger: Logger,
 	name: string,
 	channelIndex: number,
@@ -208,7 +247,7 @@ async function rearmInput(
 
 /** Read the current clock settings (0x81), then rearm from slot 0 (0x80). */
 async function rearmClock(
-	client: NewtonTcpClient,
+	client: NewtonActionClient,
 	logger: Logger,
 	name: string,
 	clockType: ClockType,
@@ -234,7 +273,7 @@ async function rearmClock(
 }
 
 export function getActionDefinitions(
-	client: NewtonTcpClient,
+	client: NewtonActionClient,
 	logger: Logger,
 	// controlId -> input number registered by the rearm label feedback.
 	rearmTargets: Map<string, number> = new Map(),
@@ -247,13 +286,17 @@ export function getActionDefinitions(
 	snapshotTargets: Map<string, string> = new Map(),
 	// controlId -> channel registered by the channel-mute feedback.
 	muteTargets: Map<string, { channelType: number; channelIndex: number }> = new Map(),
-	// Last known gain/mute per channel, fed by the preset-audio poll.
-	getGainRead: GainReadProvider = () => undefined,
+	// Retained for the module wiring and feedback cache. Gain mutations always
+	// issue a fresh 0x21 read instead of using this potentially stale cache.
+	_getGainRead: GainReadProvider = () => undefined,
 	// True when the connected firmware predates snapshots (< 0.98); the
 	// snapshot actions then fail fast with a clear message.
 	snapshotsUnsupported: () => boolean = () => false,
 	// Distinguishes a successfully read empty database from one not read yet.
 	snapshotDatabaseLoaded: () => boolean = () => false,
+	// Kept by main across definition refreshes so a configuration/UI refresh
+	// cannot split two read-modify-write operations for the same channel.
+	gainMutationQueues: Map<string, Promise<void>> = new Map(),
 ): CompanionActionDefinitions {
 	const snapshotChoices = [
 		{
@@ -262,6 +305,69 @@ export function getActionDefinitions(
 		},
 		...snapshotList.map((snapshot) => ({ id: snapshot.uuid, label: snapshot.name })),
 	]
+
+	// 0x21 is a read-modify-write prerequisite. Serialise the whole transaction
+	// per channel, not merely the TCP frames: otherwise two quick presses could
+	// both read the same old value and one increment/toggle would be lost.
+	const enqueueGainOperation = async (
+		channelType: ChannelType,
+		channelIndex: number,
+		operation: () => Promise<void>,
+	): Promise<void> => {
+		const key = `${channelType}:${channelIndex}`
+		const previous = gainMutationQueues.get(key) ?? Promise.resolve()
+		const queued = previous.catch(() => undefined).then(operation)
+		gainMutationQueues.set(key, queued)
+		void queued.then(
+			() => {
+				if (gainMutationQueues.get(key) === queued) gainMutationQueues.delete(key)
+			},
+			() => {
+				if (gainMutationQueues.get(key) === queued) gainMutationQueues.delete(key)
+			},
+		)
+		await queued
+	}
+
+	const mutateFreshGain = async (
+		name: string,
+		channelType: ChannelType.InputDsp | ChannelType.OutputDsp,
+		channelIndex: number,
+		controlId: string | undefined,
+		mutation: (current: GainReadState) => Promise<void>,
+	): Promise<void> => {
+		await enqueueGainOperation(channelType, channelIndex, async () => {
+			const current = await readFreshGainState(client, logger, name, channelType, channelIndex)
+			if (!current) {
+				reportActionFailure(logger, name, 'unable to read current gain/mute from Newton; no change was sent', controlId)
+				return
+			}
+			await mutation(current)
+		})
+	}
+
+	const mutateChannelMute = async (
+		name: string,
+		channelType: ChannelType.InputDsp | ChannelType.OutputDsp,
+		channelIndex: number,
+		mode: 'mute' | 'unmute' | 'toggle',
+		controlId?: string,
+	): Promise<void> => {
+		await mutateFreshGain(name, channelType, channelIndex, controlId, async (current) => {
+			const mute = mode === 'toggle' ? !current.muted : mode === 'mute'
+			// The device value can be outside the safe write window. Never echo it
+			// back unchecked merely because the operation only changes mute.
+			const gainDb = clampGainDb(current.gainDb)
+			const written = await buildAndRunCommand(
+				client,
+				logger,
+				name,
+				() => buildGainCommand({ channelType, channelIndex, gainDb, mute }),
+				controlId,
+			)
+			if (written) logger.reportGainRead?.(channelType, channelIndex, { gainDb, muted: mute })
+		})
+	}
 	return {
 		legacy_unsafe_action: {
 			name: 'Blocked legacy Newton action',
@@ -287,7 +393,8 @@ export function getActionDefinitions(
 		// ===== Gain =====
 		set_gain: {
 			name: 'Set Gain and Mute State',
-			description: "Set a channel's gain and mute state together.",
+			description:
+				"Set a channel's gain and mute state together. Channel ranges: Input/Output 1-16, Aux 1-10, Matrix 1-288, Trimmer/Output Group 1-64.",
 			options: [
 				{
 					type: 'dropdown',
@@ -298,11 +405,11 @@ export function getActionDefinitions(
 				},
 				{
 					type: 'number',
-					label: 'Channel Index',
+					label: 'Channel (1-based; range depends on type)',
 					id: 'channelIndex',
-					default: 0,
-					min: 0,
-					max: 287,
+					default: 1,
+					min: 1,
+					max: 288,
 				},
 				{
 					type: 'number',
@@ -323,15 +430,38 @@ export function getActionDefinitions(
 			callback: async (action) => {
 				const channelType = validChannelType(action.options['channelType'], logger, 'Set Gain', action.controlId)
 				if (channelType === null) return
+				const channel = Number(action.options['channelIndex'])
+				const channelCount = channelCountForType(channelType)
+				if (!Number.isInteger(channel) || channel < 1 || channel > channelCount) {
+					reportActionFailure(
+						logger,
+						'Set Gain',
+						`channel must be between 1 and ${channelCount} for the selected channel type`,
+						action.controlId,
+					)
+					return
+				}
 				const params = {
 					channelType,
-					channelIndex: Number(action.options['channelIndex']),
+					// Operators enter 1-based channels; Newton addresses them from 0.
+					channelIndex: channel - 1,
 					// The UI enforces min/max, but trigger expressions can inject any
 					// number: clamp to the device-safe window before building.
 					gainDb: clampGainDb(Number(action.options['gainDb'])),
 					mute: Boolean(action.options['mute']),
 				}
-				await buildAndRunCommand(client, logger, 'Set Gain', () => buildGainCommand(params), action.controlId)
+				await enqueueGainOperation(channelType, params.channelIndex, async () => {
+					const written = await buildAndRunCommand(
+						client,
+						logger,
+						'Set Gain',
+						() => buildGainCommand(params),
+						action.controlId,
+					)
+					if (written && isGainReadChannelType(channelType)) {
+						logger.reportGainRead?.(channelType, params.channelIndex, { gainDb: params.gainDb, muted: params.mute })
+					}
+				})
 			},
 		},
 
@@ -406,18 +536,16 @@ export function getActionDefinitions(
 					)
 					return
 				}
+				if (!snapshotDatabaseLoaded()) {
+					reportActionFailure(
+						logger,
+						'Snapshot Apply (by name)',
+						'the snapshot database has not been read from the device yet; retry in a moment',
+						action.controlId,
+					)
+					return
+				}
 				if (!findSnapshot(snapshotList, uuid)) {
-					// Before the database has been (re)read an unknown uuid is not
-					// proven missing: fail soft instead of blaming the selection.
-					if (!snapshotDatabaseLoaded()) {
-						reportActionFailure(
-							logger,
-							'Snapshot Apply (by name)',
-							'the snapshot database has not been read from the device yet; retry in a moment',
-							action.controlId,
-						)
-						return
-					}
 					reportActionFailure(
 						logger,
 						'Snapshot Apply (by name)',
@@ -441,6 +569,13 @@ export function getActionDefinitions(
 					)
 					return
 				}
+				const mode = validSnapshotApplyMode(
+					action.options['mode'],
+					logger,
+					'Snapshot Apply (by name)',
+					action.controlId,
+				)
+				if (mode === null) return
 				await buildAndRunCommand(
 					client,
 					logger,
@@ -449,7 +584,7 @@ export function getActionDefinitions(
 						buildSnapshotApply({
 							uuid,
 							fadingTime,
-							mode: String(action.options['mode']) as SnapshotApplyMode,
+							mode,
 						}),
 					action.controlId,
 				)
@@ -500,16 +635,16 @@ export function getActionDefinitions(
 					)
 					return
 				}
+				if (!snapshotDatabaseLoaded()) {
+					reportActionFailure(
+						logger,
+						'Apply This Button Snapshot',
+						'the snapshot database has not been read from the device yet; retry in a moment',
+						action.controlId,
+					)
+					return
+				}
 				if (!findSnapshot(snapshotList, uuid)) {
-					if (!snapshotDatabaseLoaded()) {
-						reportActionFailure(
-							logger,
-							'Apply This Button Snapshot',
-							'the snapshot database has not been read from the device yet; retry in a moment',
-							action.controlId,
-						)
-						return
-					}
 					snapshotTargets.delete(action.controlId)
 					reportActionFailure(
 						logger,
@@ -534,6 +669,13 @@ export function getActionDefinitions(
 					)
 					return
 				}
+				const mode = validSnapshotApplyMode(
+					action.options['mode'],
+					logger,
+					'Apply This Button Snapshot',
+					action.controlId,
+				)
+				if (mode === null) return
 				await buildAndRunCommand(
 					client,
 					logger,
@@ -542,7 +684,7 @@ export function getActionDefinitions(
 						buildSnapshotApply({
 							uuid,
 							fadingTime,
-							mode: String(action.options['mode']) as SnapshotApplyMode,
+							mode,
 						}),
 					action.controlId,
 				)
@@ -665,7 +807,7 @@ export function getActionDefinitions(
 			callback: async (action) => {
 				const name = 'Level Up / Down'
 				const channelType = Number(action.options['channelType'])
-				if (channelType !== Number(ChannelType.InputDsp) && channelType !== Number(ChannelType.OutputDsp)) {
+				if (!isGainReadChannelType(channelType)) {
 					reportActionFailure(logger, name, 'channel type must be Input DSP or Output DSP', action.controlId)
 					return
 				}
@@ -681,28 +823,18 @@ export function getActionDefinitions(
 					return
 				}
 				const channelIndex = channel - 1
-				const current = getGainRead(channelType, channelIndex)
-				if (!current) {
-					reportActionFailure(
+				const signed = action.options['direction'] === 'down' ? -deltaDb : deltaDb
+				await mutateFreshGain(name, channelType, channelIndex, action.controlId, async (current) => {
+					const gainDb = clampGainDb(current.gainDb + signed)
+					const written = await buildAndRunCommand(
+						client,
 						logger,
 						name,
-						'current gain not read from the device yet (preset-audio polling); retry in a moment',
+						() => buildGainCommand({ channelType, channelIndex, gainDb, mute: current.muted }),
 						action.controlId,
 					)
-					return
-				}
-				const signed = action.options['direction'] === 'down' ? -deltaDb : deltaDb
-				const gainDb = clampGainDb(current.gainDb + signed)
-				const written = await buildAndRunCommand(
-					client,
-					logger,
-					name,
-					() => buildGainCommand({ channelType, channelIndex, gainDb, mute: current.muted }),
-					action.controlId,
-				)
-				// Update button state only after the device ACKs the write; the next
-				// preset-audio poll then confirms the device's own state.
-				if (written) logger.reportGainRead?.(channelType, channelIndex, { gainDb, muted: current.muted })
+					if (written) logger.reportGainRead?.(channelType, channelIndex, { gainDb, muted: current.muted })
+				})
 			},
 		},
 
@@ -743,7 +875,7 @@ export function getActionDefinitions(
 			callback: async (action) => {
 				const name = 'Channel Mute (set/toggle)'
 				const channelType = Number(action.options['channelType'])
-				if (channelType !== Number(ChannelType.InputDsp) && channelType !== Number(ChannelType.OutputDsp)) {
+				if (!isGainReadChannelType(channelType)) {
 					reportActionFailure(logger, name, 'channel type must be Input DSP or Output DSP', action.controlId)
 					return
 				}
@@ -758,7 +890,7 @@ export function getActionDefinitions(
 					reportActionFailure(logger, name, 'invalid mode', action.controlId)
 					return
 				}
-				await applyChannelMute(client, logger, name, channelType, channel - 1, mode, getGainRead, action.controlId)
+				await mutateChannelMute(name, channelType, channel - 1, mode, action.controlId)
 			},
 		},
 
@@ -795,16 +927,21 @@ export function getActionDefinitions(
 					reportActionFailure(logger, name, 'invalid mode', action.controlId)
 					return
 				}
-				await applyChannelMute(
-					client,
-					logger,
-					name,
-					target.channelType,
-					target.channelIndex,
-					mode,
-					getGainRead,
-					action.controlId,
-				)
+				if (
+					!isGainReadChannelType(target.channelType) ||
+					!Number.isInteger(target.channelIndex) ||
+					target.channelIndex < 0 ||
+					target.channelIndex >= 16
+				) {
+					reportActionFailure(
+						logger,
+						name,
+						'the button channel is invalid; refresh its Channel Mute feedback',
+						action.controlId,
+					)
+					return
+				}
+				await mutateChannelMute(name, target.channelType, target.channelIndex, mode, action.controlId)
 			},
 		},
 

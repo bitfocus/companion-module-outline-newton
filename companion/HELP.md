@@ -1,13 +1,15 @@
 # Outline Newton
 
-Control Outline Newton DSP processors from Bitfocus Companion.
+Control the Outline Newton audio signal matrix and hub from Bitfocus Companion.
 
 ## Configuration
 
 - **Device IP Address**: the Newton's IP address.
-- **Interactivity**: choose Low, Medium or High to balance interface responsiveness and network activity. Applying a new profile recreates the UDP meter socket immediately. The control intentionally shows only profile names.
+- **Interactivity**: choose Low, Default or High to balance interface responsiveness and network activity. Applying a new profile recreates the UDP meter socket immediately. The control intentionally shows only profile names.
 
 Companion sends commands, configuration reads and snapshot traffic to Newton over TCP port `6668`. Real-time meter/status requests use UDP port `6667`; the operating system automatically chooses Companion's local UDP reply port.
+
+All channel and input numbers shown in Companion are 1-based. The module converts them internally to Newton's 0-based protocol indices before sending a command.
 
 The UDP stream also carries the live priority-patch and clock status. If UDP `6667` is blocked between Companion and the Newton, control over TCP keeps working, but meters and the priority/clock monitors stay `N/A` and the module logs a warning — check the network path in that case.
 
@@ -36,9 +38,20 @@ Set the channel type (Input DSP or Output DSP) and the channel number `1..16` in
 - **Channel Mute**: a mute key. Shows `TOGGLE MUTE / IN 3 / UNMUTED` (green) or `MUTED` (red); pressing it toggles the mute, keeping the current gain. One pair of options drives both the state and the press.
 - **Level Up / Level Down**: raise or lower the gain by a chosen dB amount (0.1-24 dB per press), keeping mute. Limited to `-80..+6 dB`.
 
-Every gain the module writes (Set Gain, Level Up/Down, mute write-backs) is hard-clamped to the device-safe `-80..+6 dB` window: values outside this range never reach the device.
+**Set Gain and Mute State** is available when a fixed value is required. It supports all documented processing banks; Companion always displays one-based numbers and sends Newton the corresponding zero-based index.
 
-Gain and mute refresh from the complete Newton audio-preset payload (`0x21`) whenever at least one Levels & Mute feedback is in use. The selected interactivity profile controls its cadence, so changes made elsewhere (another controller, the front panel, a snapshot recall) appear automatically. A Level press updates the matching Gain button immediately after the Newton ACK. Values show `--` until first read or while disconnected.
+| Channel type | Channel in Companion | Index sent to Newton |
+| ------------ | -------------------- | -------------------- |
+| Input DSP    | `1..16`              | `0..15`              |
+| Output DSP   | `1..16`              | `0..15`              |
+| Aux Mixer    | `1..10`              | `0..9`               |
+| Matrix Mixer | `1..288`             | `0..287`             |
+| Trimmer      | `1..64`              | `0..63`              |
+| Output Group | `1..64`              | `0..63`              |
+
+Every gain the module writes is hard-clamped to the device-safe `-80..+6 dB` window: values outside this range never reach the device.
+
+Gain and mute feedbacks refresh from the complete Newton audio-preset payload (`0x21`) while at least one Levels & Mute feedback is in use. The selected interactivity profile controls this background cadence, so changes made elsewhere (another controller, the front panel, a snapshot recall) appear automatically. Before a relative gain or mute write, Companion reads the current device state and serializes same-channel presses, so it does not reuse stale gain/mute values. Values show `--` until first read or while disconnected.
 
 ## Snapshots
 
@@ -64,6 +77,6 @@ Per-channel values are also published as `$(outline-newton:vu_input_1)`..`vu_inp
 - `$(outline-newton:connection_state)`: `Connected` or `Disconnected`.
 - `$(outline-newton:priority_input_1)`..`priority_input_16` and `priority_aux_input_1`..`priority_aux_input_8`: active source per priority patch (preferred 1-based names).
 - `$(outline-newton:vu_input_1)`..`vu_input_16` and `vu_output_1`..`vu_output_16`: per-channel meter levels (preferred 1-based names).
-- `priority_in_0`..`priority_in_15`, `priority_aux_0`..`priority_aux_7`, `vu_in_0`..`vu_in_15` and `vu_out_0`..`vu_out_15` remain available with their original protocol-indexed meanings for existing configurations.
+- `priority_in_1`..`priority_in_16`, `priority_aux_1`..`priority_aux_8`, `vu_in_1`..`vu_in_16` and `vu_out_1`..`vu_out_16` remain available as 1-based compatibility aliases.
 - `$(outline-newton:snapshot_support)`: `OK`, `Unknown` or `Unsupported by firmware` (firmware < 0.98).
-- `$(outline-newton:last_error)`, `last_priority_update`, `last_vu_update`: diagnostics.
+- `$(outline-newton:last_error)`, `last_priority_update`, `last_vu_update`: diagnostics. Large protocol replies are summarized rather than published in full.

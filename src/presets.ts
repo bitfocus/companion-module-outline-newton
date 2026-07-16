@@ -152,8 +152,8 @@ export function getPresetDefinitions(): CompanionPresetDefinitions {
 	}
 
 	// Level trim buttons: pick channel type, channel and the dB step in the
-	// action options. The write preserves mute and re-reads the device value,
-	// so any Channel Gain button on the same channel refreshes immediately.
+	// action options. Every press reads the device's current 0x21 state first,
+	// so they work without a separate gain feedback and preserve live mute.
 	presets['level_up'] = {
 		type: 'button',
 		category: 'Levels & Mute',

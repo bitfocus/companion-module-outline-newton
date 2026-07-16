@@ -219,6 +219,9 @@ export function getFeedbackDefinitions(
 	// controlId -> channel written by the mute feedback; the 'mute_this_channel'
 	// action reads it so one pair of options drives the whole button.
 	muteTargets: Map<string, { channelType: number; channelIndex: number }> = new Map(),
+	// Number of per-button action-result feedbacks on each control. Success and
+	// Error are commonly paired, so cleanup must wait for the last sibling.
+	lastActionFeedbackRefs: Map<string, number> = new Map(),
 ): CompanionFeedbackDefinitions {
 	const snapshotChoices = [
 		{
@@ -248,6 +251,20 @@ export function getFeedbackDefinitions(
 		gainSubs.set(feedback.id, { channelType, channelIndex })
 		return { channelType, channelIndex, label: `${isOutput ? 'OUT' : 'IN'} ${channel}` }
 	}
+	const subscribeLastActionFeedback = (feedback: { controlId?: string; options: Record<string, unknown> }): void => {
+		if (feedback.options['scope'] === 'global' || !feedback.controlId) return
+		lastActionFeedbackRefs.set(feedback.controlId, (lastActionFeedbackRefs.get(feedback.controlId) ?? 0) + 1)
+	}
+	const unsubscribeLastActionFeedback = (feedback: { controlId?: string; options: Record<string, unknown> }): void => {
+		if (feedback.options['scope'] === 'global' || !feedback.controlId) return
+		const remaining = (lastActionFeedbackRefs.get(feedback.controlId) ?? 0) - 1
+		if (remaining > 0) {
+			lastActionFeedbackRefs.set(feedback.controlId, remaining)
+			return
+		}
+		lastActionFeedbackRefs.delete(feedback.controlId)
+		getState().lastActionResults?.delete(feedback.controlId)
+	}
 
 	return {
 		mute_active: {
@@ -260,6 +277,29 @@ export function getFeedbackDefinitions(
 				color: combineRgb(255, 255, 255),
 			},
 			options: [],
+			callback: () => false,
+		},
+		preset_active: {
+			type: 'boolean',
+			name: 'Preset Active (deprecated)',
+			description:
+				'Deprecated compatibility feedback. Newton is a signal matrix/hub and has no active device preset; this feedback always remains false.',
+			defaultStyle: {
+				bgcolor: combineRgb(0, 128, 0),
+				color: combineRgb(255, 255, 255),
+			},
+			// Keep the historical option so saved 0.2.0 feedbacks remain editable,
+			// while intentionally not restoring the removed current_preset state.
+			options: [
+				{
+					type: 'number',
+					label: 'Former Preset Number (ignored)',
+					id: 'preset',
+					default: 0,
+					min: 0,
+					max: 255,
+				},
+			],
 			callback: () => false,
 		},
 		connection_status: {
@@ -303,11 +343,8 @@ export function getFeedbackDefinitions(
 				},
 				LAST_ACTION_SCOPE_OPTION,
 			],
-			unsubscribe: (feedback) => {
-				// Mirror the sibling feedbacks: drop the per-control result when
-				// the button stops watching it, so recycled control ids start clean.
-				getState().lastActionResults?.delete(feedback.controlId)
-			},
+			subscribe: subscribeLastActionFeedback,
+			unsubscribe: unsubscribeLastActionFeedback,
 			callback: (feedback) => {
 				const actionName = String(feedback.options['actionName'] ?? '').trim()
 				const { status, name } = resolveLastActionOutcome(feedback, getState())
@@ -332,9 +369,8 @@ export function getFeedbackDefinitions(
 				},
 				LAST_ACTION_SCOPE_OPTION,
 			],
-			unsubscribe: (feedback) => {
-				getState().lastActionResults?.delete(feedback.controlId)
-			},
+			subscribe: subscribeLastActionFeedback,
+			unsubscribe: unsubscribeLastActionFeedback,
 			callback: (feedback) => {
 				const actionName = String(feedback.options['actionName'] ?? '').trim()
 				const { status, name } = resolveLastActionOutcome(feedback, getState())
@@ -566,15 +602,12 @@ export function getFeedbackDefinitions(
 					snapshotTargets.delete(feedback.controlId)
 					return { text: 'APPLY\n#snapshot' }
 				}
+				if (!getState().snapshotDatabaseLoaded) {
+					snapshotTargets.set(feedback.controlId, uuid)
+					return { text: 'SNAPSHOT\nLOADING…' }
+				}
 				const snapshot = findSnapshot(snapshotList, uuid)
 				if (!snapshot) {
-					// Before the database has been (re)read, an unknown uuid is not
-					// missing — it is simply not confirmed yet. Keep the target so a
-					// valid button does not break during the read window.
-					if (!getState().snapshotDatabaseLoaded) {
-						snapshotTargets.set(feedback.controlId, uuid)
-						return { text: 'SNAPSHOT\nLOADING…' }
-					}
 					snapshotTargets.delete(feedback.controlId)
 					return { text: 'SNAPSHOT\nMISSING' }
 				}

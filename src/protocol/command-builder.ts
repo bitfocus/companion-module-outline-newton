@@ -9,6 +9,7 @@ import {
 	SPC_CRC_SIZE,
 	SPC_HEADER,
 	SPC_HEADER_SIZE,
+	SNAPSHOT_MAX_PAYLOAD_BYTES,
 	SnapshotCmd,
 } from './constants.js'
 import { appendCrc16 } from './crc16.js'
@@ -362,6 +363,12 @@ export function buildRearmClockCommand(
 	if (clock.list.length !== CLOCK_LIST_LENGTH) {
 		throw new Error('Clock priority list must contain exactly 16 entries')
 	}
+	if (
+		clock.isForced &&
+		(!Number.isInteger(clock.forcedIndex) || clock.forcedIndex < 0 || clock.forcedIndex >= CLOCK_LIST_LENGTH)
+	) {
+		throw new RangeError(`Forced clock index must be between 0 and ${CLOCK_LIST_LENGTH - 1}`)
+	}
 	const buf = Buffer.alloc(25)
 	buf[0] = LegacyCmd.SetProcessingClock
 	buf[1] = FIXED_BYTE_0x33
@@ -369,7 +376,7 @@ export function buildRearmClockCommand(
 	buf[3] = clockType & 0xff
 	for (let i = 0; i < CLOCK_LIST_LENGTH; i++) buf[4 + i] = clock.list[i] & 0xff
 	buf[20] = clock.isForced ? 1 : 0
-	buf[21] = clock.isForced ? (clock.list[clock.forcedIndex] ?? 0) & 0xff : 0
+	buf[21] = clock.isForced ? clock.list[clock.forcedIndex] & 0xff : 0
 	buf[22] = clock.is48 ? 1 : 0
 	buf[23] = 1
 	buf[24] = rearmIndex & 0xff
@@ -408,6 +415,9 @@ export function buildSetSensitivityCommand(channelPair: number, is26dB: boolean)
 export function buildSPC(specialCmd: SnapshotCmd, jsonPayload?: Record<string, unknown>): Buffer {
 	const payloadStr = jsonPayload ? JSON.stringify(jsonPayload) : ''
 	const payloadBuf = Buffer.from(payloadStr, 'utf-8')
+	if (payloadBuf.length > SNAPSHOT_MAX_PAYLOAD_BYTES) {
+		throw new RangeError(`SPC payload exceeds the snapshot limit (${payloadBuf.length} bytes)`)
+	}
 
 	const totalLen = SPC_HEADER_SIZE + payloadBuf.length + SPC_CRC_SIZE
 	if (totalLen > 0xffff) {

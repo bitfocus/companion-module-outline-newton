@@ -211,6 +211,8 @@ export const SPC_OFFSET_LEN_MSB = 4
 export const SPC_OFFSET_LEN_LSB = 5
 export const SPC_HEADER_SIZE = 6 // bytes before payload
 export const SPC_CRC_SIZE = 2 // CRC at end
+/** Snapshot addendum §4.2.2 maximum UTF-8 JSON payload length. */
+export const SNAPSHOT_MAX_PAYLOAD_BYTES = 65_520
 
 // ===== SPR Message Structure Offsets =====
 export const SPR_OFFSET_HEADER = 0 // 0xF1

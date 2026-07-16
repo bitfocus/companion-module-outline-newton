@@ -5,7 +5,7 @@ import { EventEmitter } from 'node:events'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
-import { ChannelType, SnapshotCmd } from '../dist/protocol/constants.js'
+import { ChannelType, SNAPSHOT_MAX_PAYLOAD_BYTES, SnapshotCmd } from '../dist/protocol/constants.js'
 import {
 	buildDelayCommand,
 	buildFaderCommand,
@@ -22,8 +22,11 @@ import {
 	MessageAccumulator,
 	PRESET_AUDIO_RESPONSE_LENGTH,
 	isFirmwareAtLeast,
+	isLegacyAckResponse,
+	isLegacyErrResponse,
 	parseClockSelected,
 	parseClockStateResponse,
+	parseImportSerialResponse,
 	parseLegacyResponse,
 	parsePresetAudioGains,
 	parsePriorityListResponse,
@@ -31,14 +34,18 @@ import {
 	parseSPR,
 } from '../dist/protocol/command-parser.js'
 import { verifyCrc16 } from '../dist/protocol/crc16.js'
-import { NewtonTcpClient } from '../dist/protocol/tcp-client.js'
+import { NewtonTcpClient, isQueueRejection } from '../dist/protocol/tcp-client.js'
+import { presetAudioReadOptions } from '../dist/preset-audio.js'
 import { appendCrc16 } from '../dist/protocol/crc16.js'
 import { decodeStatusMeters, VuListener } from '../dist/protocol/vu-listener.js'
 import { UpgradeScripts } from '../dist/upgrades.js'
 import { getFeedbackDefinitions } from '../dist/feedbacks.js'
 import { getActionDefinitions } from '../dist/actions.js'
+import { parseSnapshotDatabase } from '../dist/snapshots.js'
 import { getVariableDefinitions } from '../dist/variables.js'
 import { SETTINGS, getConfigFields, getInteractivityProfile, normalizeInteractivity } from '../dist/config.js'
+import { bindActionClient } from '../dist/action-client.js'
+import { formatStructuredDiagnostic } from '../dist/diagnostics.js'
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -72,6 +79,26 @@ function buildSpr(command, payload = {}) {
 	payloadBytes.copy(frame, 8)
 	appendCrc16(frame)
 	return frame
+}
+
+function buildPresetAudioResponse(inputDsp = [], outputDsp = []) {
+	const response = Buffer.alloc(PRESET_AUDIO_RESPONSE_LENGTH)
+	response[0] = 0x33
+	const gainBase = 2 + 1008
+	const write = (entryIndex, state) => {
+		if (!state) return
+		const offset = gainBase + entryIndex * 5
+		response.writeFloatLE(state.gainDb, offset)
+		response[offset + 4] = state.muted ? 1 : 0
+	}
+	inputDsp.forEach((state, index) => write(index, state))
+	outputDsp.forEach((state, index) => write(16 + index, state))
+	return response
+}
+
+function presetAudioResult(options, inputDsp = [], outputDsp = []) {
+	const rx = buildPresetAudioResponse(inputDsp, outputDsp)
+	return { success: true, rx, parsed: options?.parser?.(rx) }
 }
 
 test('builds gain command with little-endian int32 and float32', () => {
@@ -137,12 +164,61 @@ test('keeps action-result colors independent for two controls using the same act
 	assert.equal(definitions.last_action_success.callback({ controlId: 'button-new', options }), false)
 })
 
+test('last-action cleanup waits for the final paired feedback on a control', () => {
+	const state = {
+		lastActionResults: new Map([
+			['button-1', { name: 'Set Gain', success: true, responseHex: '3300', controlId: 'button-1' }],
+		]),
+	}
+	const refs = new Map()
+	const definitions = getFeedbackDefinitions(
+		() => state,
+		new Map(),
+		new Map(),
+		new Map(),
+		new Map(),
+		[],
+		new Map(),
+		refs,
+	)
+	const successFeedback = { controlId: 'button-1', options: { actionName: 'Set Gain', scope: 'this' } }
+	const errorFeedback = { controlId: 'button-1', options: { actionName: 'Set Gain', scope: 'this' } }
+	definitions.last_action_success.subscribe(successFeedback)
+	definitions.last_action_error.subscribe(errorFeedback)
+	assert.equal(refs.get('button-1'), 2)
+
+	definitions.last_action_success.unsubscribe(successFeedback)
+	assert.equal(refs.get('button-1'), 1)
+	assert.equal(
+		definitions.last_action_success.callback({
+			controlId: 'button-1',
+			options: { actionName: 'Set Gain', scope: 'this' },
+		}),
+		true,
+	)
+	assert.equal(state.lastActionResults.has('button-1'), true)
+
+	definitions.last_action_error.unsubscribe(errorFeedback)
+	assert.equal(refs.has('button-1'), false)
+	assert.equal(state.lastActionResults.has('button-1'), false)
+})
+
+test('only a structurally valid snapshot database is considered loaded', () => {
+	assert.deepEqual(parseSnapshotDatabase({ snaplist: [] }), [])
+	assert.deepEqual(parseSnapshotDatabase({ snaplist: [{ uuid: 'abc', description: 'Show A' }] }), [
+		{ uuid: 'abc', name: 'Show A' },
+	])
+	assert.equal(parseSnapshotDatabase({ count: 1 }), null)
+	assert.equal(parseSnapshotDatabase({ snaplist: [{ description: 'Missing uuid' }] }), null)
+	assert.equal(parseSnapshotDatabase({ snaplist: [{ uuid: 'same' }, { uuid: 'same' }] }), null)
+})
+
 test('maps the Newton legacy ACK to green and a non-ACK to red', async () => {
 	const reports = []
 	const logger = { log: () => undefined, reportActionResult: (result) => reports.push(result) }
 	const action = {
 		controlId: 'gain-button',
-		options: { channelType: ChannelType.InputDsp, channelIndex: 0, gainDb: -20, mute: false },
+		options: { channelType: ChannelType.InputDsp, channelIndex: 1, gainDb: -20, mute: false },
 	}
 
 	const successfulClient = {
@@ -210,6 +286,22 @@ test('restored snapshot database action sends Get Database and reports its contr
 	assert.equal(choices[0].label, 'No snapshots on device')
 })
 
+test('action result variables truncate oversized response payloads', async () => {
+	const reports = []
+	const rx = Buffer.alloc(512, 0xab)
+	rx[0] = 0x33
+	rx[1] = 0x00
+	const actions = getActionDefinitions(
+		{ sendCommandExpect: async () => ({ success: true, rx }) },
+		{ log: () => undefined, reportActionResult: (result) => reports.push(result) },
+	)
+
+	await actions.snapshot_get_database.callback({ controlId: 'snapshot-button', options: {} })
+	assert.match(reports.at(-1).responseHex, /^3300/)
+	assert.match(reports.at(-1).responseHex, /512 bytes total/)
+	assert.ok(reports.at(-1).responseHex.length < 300)
+})
+
 test('uses the documented ChannelType mapping', () => {
 	assert.deepEqual(
 		{
@@ -224,7 +316,7 @@ test('uses the documented ChannelType mapping', () => {
 	)
 })
 
-test('offers named interactivity profiles and normalizes old configurations to Medium', () => {
+test('offers named interactivity profiles and normalizes old configurations to Default', () => {
 	assert.deepEqual(getInteractivityProfile('low'), {
 		meterPollInterval: 1000,
 		presetAudioPollInterval: 5000,
@@ -238,6 +330,8 @@ test('offers named interactivity profiles and normalizes old configurations to M
 		presetAudioPollInterval: 1000,
 	})
 	assert.equal(SETTINGS.priorityMetadataPollInterval, 1000)
+	assert.equal(SETTINGS.presetAudioTimeoutMs, 12000)
+	assert.equal(SETTINGS.actionQueueTtlMs, 16000)
 	assert.equal(normalizeInteractivity('unexpected'), 'medium')
 
 	const field = getConfigFields().find((entry) => entry.id === 'interactivity')
@@ -245,7 +339,7 @@ test('offers named interactivity profiles and normalizes old configurations to M
 		field.choices.map((choice) => ({ id: choice.id, label: choice.label })),
 		[
 			{ id: 'low', label: 'Low' },
-			{ id: 'medium', label: 'Medium' },
+			{ id: 'medium', label: 'Default' },
 			{ id: 'high', label: 'High' },
 		],
 	)
@@ -289,6 +383,16 @@ test('parses legacy OK and ERR responses', () => {
 		payload: Buffer.from('0102', 'hex'),
 	})
 	assert.equal(parseLegacyResponse(Buffer.from('6600', 'hex')).success, false)
+	assert.equal(isLegacyAckResponse(Buffer.from('3300', 'hex')), true)
+	assert.equal(isLegacyAckResponse(Buffer.from('6600', 'hex')), true)
+	assert.equal(isLegacyAckResponse(Buffer.from('33000102', 'hex')), false)
+	assert.equal(isLegacyAckResponse(Buffer.from('0d05d8d8000d', 'hex')), false)
+})
+
+test('accepts an unprovisioned Newton serial as a valid empty identity response', () => {
+	const response = Buffer.alloc(18)
+	response[0] = 0x33
+	assert.equal(parseImportSerialResponse(response), '')
 })
 
 test('builds and parses CRC-valid SPR JSON payload', () => {
@@ -301,7 +405,14 @@ test('builds and parses CRC-valid SPR JSON payload', () => {
 	assert.equal(parsed.success, true)
 	assert.equal(parsed.command, SnapshotCmd.GetDatabase)
 	assert.deepEqual(parsed.payload, { count: 1 })
-	assert.throws(() => buildSPC(SnapshotCmd.Store, { description: 'x'.repeat(65528) }), /16-bit frame limit/)
+	const jsonOverhead = Buffer.byteLength(JSON.stringify({ description: '' }))
+	assert.doesNotThrow(() =>
+		buildSPC(SnapshotCmd.Store, { description: 'x'.repeat(SNAPSHOT_MAX_PAYLOAD_BYTES - jsonOverhead) }),
+	)
+	assert.throws(
+		() => buildSPC(SnapshotCmd.Store, { description: 'x'.repeat(SNAPSHOT_MAX_PAYLOAD_BYTES - jsonOverhead + 1) }),
+		/snapshot limit/,
+	)
 })
 
 test('parses priority patch state from 0x2B offset 666', () => {
@@ -431,6 +542,20 @@ test('VU poller queries Newton UDP port 6667 from an OS-chosen local port', asyn
 	}
 })
 
+test('VU listener accepts meter packets only from the configured Newton address and UDP port', () => {
+	const listener = new VuListener('192.0.2.30', 6667)
+	assert.equal(listener.isExpectedSource({ address: '192.0.2.30', port: 6667 }), true)
+	assert.equal(listener.isExpectedSource({ address: '192.0.2.30', port: 6666 }), false)
+	assert.equal(listener.isExpectedSource({ address: '192.0.2.31', port: 6667 }), false)
+	assert.equal(listener.isExpectedSource({ address: '192.0.2.30' }), false)
+
+	// For a DNS target the peer address is resolved by UDPHelper, but the
+	// response must still come from the configured meter server port.
+	const dnsListener = new VuListener('newton.local', 6667)
+	assert.equal(dnsListener.isExpectedSource({ address: '192.0.2.30', port: 6667 }), true)
+	assert.equal(dnsListener.isExpectedSource({ address: '192.0.2.30', port: 6666 }), false)
+})
+
 test('VU poller uses UDP 6667 with an ephemeral local port and does not use TCP status polling', async () => {
 	const [source, mainSource] = await Promise.all([
 		readFile(new URL('../src/protocol/vu-listener.ts', import.meta.url), 'utf8'),
@@ -443,11 +568,9 @@ test('VU poller uses UDP 6667 with an ephemeral local port and does not use TCP 
 	assert.doesNotMatch(mainSource, /buildImportSignalsCommand/)
 	assert.match(mainSource, /buildImportAudioPresetCommand/)
 	assert.match(mainSource, /const interactivityChanged = this\.config\.interactivity !== nextInteractivity/)
-	assert.match(mainSource, /if \(targetChanged \|\| interactivityChanged\) this\.stopVuListener\(\)/)
-	assert.match(
-		mainSource,
-		/if \(targetChanged \|\| interactivityChanged \|\| !this\.vuListener\) this\.startVuListener\(\)/,
-	)
+	assert.match(mainSource, /if \(!targetChanged && !interactivityChanged\) return/)
+	assert.match(mainSource, /if \(targetChanged\) \{[\s\S]*?this\.startVuListener\(\)/)
+	assert.match(mainSource, /else if \(this\.client\.isConnected\) this\.startPresetAudioPolling\(\)/)
 })
 
 test('does not let an unexpected SPR command resolve the active SPC request', async () => {
@@ -466,13 +589,18 @@ test('does not let an unexpected SPR command resolve the active SPC request', as
 	client.destroy()
 })
 
-test('timeout destroys the session and rejects queued commands before reconnecting', async () => {
+test('timeout destroys the session, rejects queued commands, and retries once after the backoff', async () => {
 	const sockets = []
-	const client = new NewtonTcpClient('newton', 6668, () => {
-		const socket = new FakeSocket()
-		sockets.push(socket)
-		return socket
-	})
+	const client = new NewtonTcpClient(
+		'newton',
+		6668,
+		() => {
+			const socket = new FakeSocket()
+			sockets.push(socket)
+			return socket
+		},
+		15,
+	)
 	client.connect()
 	sockets[0].emit('connect')
 	const first = client.sendCommandExpect(Buffer.from('0100', 'hex'), { name: 'first', timeoutMs: 10 })
@@ -480,6 +608,8 @@ test('timeout destroys the session and rejects queued commands before reconnecti
 	await assert.rejects(first, /first timeout/)
 	await assert.rejects(queued, /first timeout/)
 	assert.equal(sockets[0].destroyed, true)
+	assert.equal(sockets.length, 1, 'no immediate reconnect storm after a timeout')
+	await sleep(20)
 	assert.equal(sockets.length, 2)
 
 	// A late frame on the old socket is ignored. A fresh command works only on
@@ -491,6 +621,29 @@ test('timeout destroys the session and rejects queued commands before reconnecti
 	sockets[1].emit('data', Buffer.from('3300', 'hex'))
 	assert.equal((await fresh).success, true)
 	client.destroy()
+})
+
+test('destroy cancels a timeout reconnect that has not started yet', async () => {
+	const sockets = []
+	const client = new NewtonTcpClient(
+		'newton',
+		6668,
+		() => {
+			const socket = new FakeSocket()
+			sockets.push(socket)
+			return socket
+		},
+		30,
+	)
+	client.connect()
+	sockets[0].emit('connect')
+
+	const pending = client.sendCommandExpect(Buffer.from('0100', 'hex'), { timeoutMs: 10 })
+	await assert.rejects(pending, /timeout/)
+	assert.equal(sockets.length, 1)
+	client.destroy()
+	await sleep(40)
+	assert.equal(sockets.length, 1)
 })
 
 test('a late send rejection cannot reject the next active command', async () => {
@@ -520,6 +673,273 @@ test('a late send rejection cannot reject the next active command', async () => 
 	socket.emit('data', Buffer.from('3300', 'hex'))
 	assert.equal((await second).success, true)
 	client.destroy()
+})
+
+test('a TCP connection error keeps one helper and lets its delayed retry own recovery', async () => {
+	const sockets = []
+	const client = new NewtonTcpClient('newton', 6668, () => {
+		const socket = new FakeSocket()
+		sockets.push(socket)
+		return socket
+	})
+	client.on('error', () => undefined)
+	client.connect()
+	sockets[0].emit('connect')
+	sockets[0].isConnected = false
+	sockets[0].emit('error', new Error('ECONNREFUSED'))
+	await sleep(10)
+
+	// A real TCPHelper retries the same helper after its 10-second interval;
+	// constructing another one synchronously here caused a busy reconnect loop.
+	assert.equal(sockets.length, 1)
+	assert.equal(sockets[0].destroyed, false)
+	client.destroy()
+})
+
+test('a no-wait send that returns false invalidates the session instead of silently succeeding', async () => {
+	let socket
+	socket = new FakeSocket(() => {
+		socket.isConnected = false
+		return Promise.resolve(false)
+	})
+	const client = new NewtonTcpClient('newton', 6668, () => socket)
+	const commandErrors = []
+	let disconnected = 0
+	client.on('commandError', (name, error) => commandErrors.push({ name, error }))
+	client.on('disconnected', () => disconnected++)
+	client.connect()
+	socket.emit('connect')
+	client.sendCommandNoWait(Buffer.from('0100', 'hex'))
+	await sleep(0)
+
+	assert.equal(commandErrors.length, 1)
+	assert.equal(commandErrors[0].name, '0x01')
+	assert.match(commandErrors[0].error.message, /failed to send/)
+	assert.equal(disconnected, 1)
+	client.destroy()
+})
+
+test('an active TCP send rejection tears down the session and rejects queued work', async () => {
+	const sockets = []
+	const client = new NewtonTcpClient('newton', 6668, () => {
+		const failWrites = sockets.length === 0
+		const socket = new FakeSocket(() =>
+			failWrites ? Promise.reject(new Error('write failed')) : Promise.resolve(true),
+		)
+		sockets.push(socket)
+		return socket
+	})
+	client.connect()
+	sockets[0].emit('connect')
+
+	const active = client.sendCommandExpect(Buffer.from('0100', 'hex'), { name: 'active', timeoutMs: 100 })
+	const queued = client.sendCommandExpect(Buffer.from('0200', 'hex'), { name: 'queued', timeoutMs: 100 })
+	const activeRejected = assert.rejects(active, /active failed to send: write failed/)
+	const queuedRejected = assert.rejects(queued, /active failed to send: write failed/)
+	await Promise.all([activeRejected, queuedRejected])
+
+	assert.equal(sockets[0].sent.length, 1)
+	assert.equal(sockets[0].destroyed, true)
+	assert.equal(sockets.length, 2)
+
+	// A reply arriving on the old transport cannot resolve later work. A fresh
+	// connection is required before the next command is transmitted.
+	sockets[0].emit('data', Buffer.from('3300', 'hex'))
+	sockets[1].emit('connect')
+	const fresh = client.sendCommandExpect(Buffer.from('0300', 'hex'), { timeoutMs: 100 })
+	await sleep(0)
+	sockets[1].emit('data', Buffer.from('3300', 'hex'))
+	assert.equal((await fresh).success, true)
+	client.destroy()
+})
+
+test('TCP queue expires stale work before it can be sent', async () => {
+	const socket = new FakeSocket()
+	const client = new NewtonTcpClient('newton', 6668, () => socket)
+	client.connect()
+	socket.emit('connect')
+
+	const active = client.sendCommandExpect(Buffer.from('0100', 'hex'), { name: 'active', timeoutMs: 200 })
+	const stale = client.sendCommandExpect(Buffer.from('0200', 'hex'), {
+		name: 'stale poll',
+		priority: 'poll',
+		timeoutMs: 200,
+		queueTtlMs: 15,
+	})
+	const staleRejected = assert.rejects(stale, /stale poll expired in command queue after 15ms/)
+	await sleep(30)
+	await staleRejected
+	assert.equal(socket.sent.length, 1)
+
+	socket.emit('data', Buffer.from('3300', 'hex'))
+	assert.equal((await active).success, true)
+	assert.equal(socket.sent.length, 1)
+	client.destroy()
+})
+
+test('TCP gives a queued action precedence over queued background polling', async () => {
+	const socket = new FakeSocket()
+	const client = new NewtonTcpClient('newton', 6668, () => socket)
+	client.connect()
+	socket.emit('connect')
+
+	const active = client.sendCommandExpect(Buffer.from('0100', 'hex'), { name: 'active', timeoutMs: 200 })
+	const poll = client.sendCommandExpect(Buffer.from('0200', 'hex'), {
+		name: 'poll',
+		priority: 'poll',
+		timeoutMs: 200,
+	})
+	const action = client.sendCommandExpect(Buffer.from('0300', 'hex'), {
+		name: 'action',
+		priority: 'action',
+		timeoutMs: 200,
+	})
+	await sleep(0)
+	assert.deepEqual(
+		socket.sent.map((data) => data.toString('hex')),
+		['0100'],
+	)
+
+	socket.emit('data', Buffer.from('3300', 'hex'))
+	assert.equal((await active).success, true)
+	await sleep(0)
+	assert.deepEqual(
+		socket.sent.map((data) => data.toString('hex')),
+		['0100', '0300'],
+	)
+
+	socket.emit('data', Buffer.from('3300', 'hex'))
+	assert.equal((await action).success, true)
+	await sleep(0)
+	assert.deepEqual(
+		socket.sent.map((data) => data.toString('hex')),
+		['0100', '0300', '0200'],
+	)
+	socket.emit('data', Buffer.from('3300', 'hex'))
+	assert.equal((await poll).success, true)
+	client.destroy()
+})
+
+test('TCP rejects excess operator work instead of growing an unbounded command queue', async () => {
+	const socket = new FakeSocket()
+	const client = new NewtonTcpClient('newton', 6668, () => socket)
+	client.connect()
+	socket.emit('connect')
+
+	const active = client.sendCommandExpect(Buffer.from('0100', 'hex'), { timeoutMs: 1000 })
+	const waiting = Array.from({ length: 31 }, (_, index) =>
+		client.sendCommandExpect(Buffer.from([0x02, index]), { timeoutMs: 1000, priority: 'action' }),
+	)
+	const overflow = client.sendCommandExpect(Buffer.from('ffff', 'hex'), { timeoutMs: 1000 })
+	await assert.rejects(overflow, /Command queue is full \(maximum 32 pending commands\)/)
+	assert.equal(socket.sent.length, 1)
+
+	const activeRejected = assert.rejects(active, /Client destroyed/)
+	const waitingRejected = waiting.map((pending) => assert.rejects(pending, /Client destroyed/))
+	client.destroy()
+	await Promise.all([activeRejected, ...waitingRejected])
+})
+
+test('TCP makes room for an operator action by dropping the oldest queued poll', async () => {
+	const socket = new FakeSocket()
+	const client = new NewtonTcpClient('newton', 6668, () => socket)
+	client.connect()
+	socket.emit('connect')
+
+	const active = client.sendCommandExpect(Buffer.from('0100', 'hex'), { name: 'active', timeoutMs: 1000 })
+	const polls = Array.from({ length: 31 }, (_, index) =>
+		client.sendCommandExpect(Buffer.from([0x02, index]), { name: `poll ${index}`, timeoutMs: 1000, priority: 'poll' }),
+	)
+	const operator = client.sendCommandExpect(Buffer.from('ffff', 'hex'), { name: 'operator', timeoutMs: 1000 })
+	await assert.rejects(polls[0], /poll 0 dropped from command queue to run an operator action/)
+	assert.equal(socket.sent.length, 1)
+
+	socket.emit('data', Buffer.from('3300', 'hex'))
+	assert.equal((await active).success, true)
+	await sleep(0)
+	assert.equal(socket.sent[1].toString('hex'), 'ffff')
+	socket.emit('data', Buffer.from('3300', 'hex'))
+	assert.equal((await operator).success, true)
+
+	const remainingRejected = polls.slice(1).map((pending) => assert.rejects(pending, /Client destroyed/))
+	client.destroy()
+	await Promise.all(remainingRejected)
+})
+
+test('action definitions bind a fixed TCP session across a target change', async () => {
+	const calls = []
+	const sessionA = {
+		sendCommandExpect: async (cmd, options) => {
+			calls.push({ session: 'A', cmd: Buffer.from(cmd), options })
+			return { name: 'A', tx: Buffer.from(cmd), rx: Buffer.from('3300', 'hex'), success: true, parsed: null }
+		},
+	}
+	const sessionB = {
+		sendCommandExpect: async (cmd, options) => {
+			calls.push({ session: 'B', cmd: Buffer.from(cmd), options })
+			return { name: 'B', tx: Buffer.from(cmd), rx: Buffer.from('3300', 'hex'), success: true, parsed: null }
+		},
+	}
+	const actionForA = bindActionClient(sessionA, 3000)
+	const actionForB = bindActionClient(sessionB, 3000)
+
+	// The callback registered before a host change remains bound to A; only a
+	// freshly registered definition can use B. It can never redirect mid-action.
+	await actionForA.sendCommandExpect(Buffer.from('2100', 'hex'))
+	await actionForB.sendCommandExpect(Buffer.from('0100', 'hex'))
+	await actionForA.sendCommandExpect(Buffer.from('0101', 'hex'))
+	assert.deepEqual(
+		calls.map((call) => call.session),
+		['A', 'B', 'A'],
+	)
+	assert.equal(calls[0].options.timeoutMs, 3000)
+})
+
+test('bound actions can wait behind a full-preset poll but retain their short on-wire timeout', async () => {
+	const sockets = []
+	const client = new NewtonTcpClient('newton', 6668, () => {
+		const socket = new FakeSocket()
+		sockets.push(socket)
+		return socket
+	})
+	client.connect()
+	sockets[0].emit('connect')
+
+	const presetPoll = client.sendCommandExpect(buildImportAudioPresetCommand(), {
+		name: 'Import Audio Preset',
+		timeoutMs: 200,
+		expectedLength: PRESET_AUDIO_RESPONSE_LENGTH,
+		isSuccess: (data) => data.length === PRESET_AUDIO_RESPONSE_LENGTH && data[0] === 0x33,
+		parser: parsePresetAudioGains,
+		priority: 'poll',
+	})
+	await sleep(0)
+
+	const actionClient = bindActionClient(client, 30, 120)
+	const action = actionClient.sendCommandExpect(Buffer.from('0100', 'hex'), { name: 'Set Gain' })
+	await sleep(50)
+	assert.equal(sockets[0].sent.length, 1, 'the action remains queued beyond its on-wire timeout')
+
+	const response = Buffer.alloc(PRESET_AUDIO_RESPONSE_LENGTH)
+	response[0] = 0x33
+	sockets[0].emit('data', response)
+	await presetPoll
+	await sleep(0)
+	assert.equal(sockets[0].sent[1].toString('hex'), '0100')
+	await assert.rejects(action, /Set Gain timeout after 30ms/)
+	client.destroy()
+})
+
+test('structured snapshot diagnostics are bounded before they reach Companion variables', () => {
+	const payload = { snapshotDatabase: 'x'.repeat(1024) }
+	const serialized = JSON.stringify(payload)
+	const formatted = formatStructuredDiagnostic(payload)
+	const prefix = Buffer.from(serialized, 'utf8').subarray(0, 256).toString('utf8')
+	assert.equal(formatted, `${prefix}… (${Buffer.byteLength(serialized)} bytes total)`)
+
+	const cyclic = {}
+	cyclic.self = cyclic
+	assert.equal(formatStructuredDiagnostic(cyclic), 'Unserializable response payload')
 })
 
 test('upgrade retains legacy mute ids and migrates generated priority presets safely', () => {
@@ -847,6 +1267,10 @@ test('builds clock get/rearm packets and parses the 19-byte clock state', () => 
 		rearm.toString('hex'),
 		'80336600' + '02030405060708090a0d0c0b0e00010f' + '01' + '04' + '00' + '01' + '00',
 	)
+	assert.throws(
+		() => buildRearmClockCommand(0, { ...parsed, forcedIndex: 16 }, 0),
+		/Forced clock index must be between 0 and 15/,
+	)
 
 	// Selected clocks come from blob bytes 631/648/665.
 	const blob = Buffer.alloc(1024)
@@ -924,7 +1348,18 @@ test('snapshot apply by name uses the device list for the dropdown and applies b
 		},
 	}
 	const logger = { log: () => undefined, reportActionResult: () => undefined }
-	const actions = getActionDefinitions(client, logger, new Map(), new Map(), snapshotList)
+	const actions = getActionDefinitions(
+		client,
+		logger,
+		new Map(),
+		new Map(),
+		snapshotList,
+		new Map(),
+		new Map(),
+		() => undefined,
+		() => false,
+		() => true,
+	)
 
 	// The dropdown lists a placeholder plus one entry per device snapshot, by name.
 	const choices = actions.snapshot_apply_selected.options.find((o) => o.id === 'uuid').choices
@@ -950,13 +1385,20 @@ test('snapshot apply by name uses the device list for the dropdown and applies b
 	sent.length = 0
 	await actions.snapshot_apply_selected.callback({ options: { uuid: '', fadingTime: 2000, mode: 'Direct' } })
 	assert.deepEqual(sent, [])
+
+	// Trigger expressions can inject arbitrary strings, so mode is validated at
+	// action time rather than trusted from the dropdown.
+	await actions.snapshot_apply_selected.callback({
+		options: { uuid: snapshotList[0].uuid, fadingTime: 2000, mode: 'invalid-mode' },
+	})
+	assert.deepEqual(sent, [])
 })
 
 test('snapshot label feedback writes the name and feeds the apply action', async () => {
 	const snapshotList = [{ uuid: '00000034-40c8-6d88-8c0b-59899f12d260', name: 'Show opening' }]
 	const snapshotTargets = new Map()
 	const label = getFeedbackDefinitions(
-		() => ({}),
+		() => ({ snapshotDatabaseLoaded: true }),
 		new Map(),
 		new Map(),
 		new Map(),
@@ -985,7 +1427,18 @@ test('snapshot label feedback writes the name and feeds the apply action', async
 		},
 	}
 	const logger = { log: () => undefined, reportActionResult: () => undefined }
-	const actions = getActionDefinitions(client, logger, new Map(), new Map(), snapshotList, snapshotTargets)
+	const actions = getActionDefinitions(
+		client,
+		logger,
+		new Map(),
+		new Map(),
+		snapshotList,
+		snapshotTargets,
+		new Map(),
+		() => undefined,
+		() => false,
+		() => true,
+	)
 
 	await actions.apply_this_snapshot.callback({ controlId: 's1', options: { fadingTime: 0, mode: 'ThroughZero' } })
 	assert.equal(sent.length, 1)
@@ -995,6 +1448,10 @@ test('snapshot label feedback writes the name and feeds the apply action', async
 	// A button without the label feedback sends nothing.
 	sent.length = 0
 	await actions.apply_this_snapshot.callback({ controlId: 's-unknown', options: { fadingTime: 0, mode: 'Direct' } })
+	assert.deepEqual(sent, [])
+
+	// The feedback-bound variant validates its runtime mode too.
+	await actions.apply_this_snapshot.callback({ controlId: 's1', options: { fadingTime: 0, mode: 'invalid-mode' } })
 	assert.deepEqual(sent, [])
 })
 
@@ -1082,11 +1539,20 @@ test('channel gain/mute feedbacks subscribe channels and render device reads', (
 	assert.equal(muteTargets.size, 0)
 })
 
-test('mute-this-channel toggles from the cached state preserving the gain', async () => {
+test('mute actions fetch fresh 0x21 state and preserve gain without a gain feedback', async () => {
 	const sent = []
+	let outputState = { gainDb: -4.5, muted: false }
 	const client = {
-		sendCommandExpect: async (cmd) => {
+		sendCommandExpect: async (cmd, options) => {
 			sent.push(Buffer.from(cmd))
+			if (cmd[0] === 0x21) {
+				const outputDsp = []
+				outputDsp[4] = outputState
+				return presetAudioResult(options, [], outputDsp)
+			}
+			if (cmd[0] === 0x01) {
+				outputState = { gainDb: cmd.readFloatLE(6), muted: cmd[10] !== 0 }
+			}
 			return { success: true, rx: Buffer.from('3300', 'hex') }
 		},
 	}
@@ -1094,41 +1560,88 @@ test('mute-this-channel toggles from the cached state preserving the gain', asyn
 	const logger = {
 		log: () => undefined,
 		reportActionResult: () => undefined,
-		reportGainRead: (t, i, s) => reads.push(s),
+		reportGainRead: (_type, _index, state) => reads.push(state),
 	}
-	// Cached state comes from the interactivity-controlled 0x21 audio-preset poll (no 0x01 "get").
-	const gains = new Map([['1:4', { gainDb: -4.5, muted: false }]])
-	const getGainRead = (t, i) => gains.get(`${t}:${i}`)
 	const muteTargets = new Map([['ctrl9', { channelType: 1, channelIndex: 4 }]])
-	const actions = getActionDefinitions(client, logger, new Map(), new Map(), [], new Map(), muteTargets, getGainRead)
+	// No Gain/Mute feedback is registered and no cache is supplied.
+	const actions = getActionDefinitions(client, logger, new Map(), new Map(), [], new Map(), muteTargets)
 
 	await actions.mute_this_channel.callback({ controlId: 'ctrl9', options: { mode: 'toggle' } })
-	// One single Set Gain write; gain preserved, mute set, optimistic report.
 	assert.deepEqual(
-		sent.map((c) => c.length),
-		[11],
+		sent.map((command) => command[0]),
+		[0x21, 0x01],
 	)
-	assert.equal(sent[0].readFloatLE(6).toFixed(1), '-4.5')
-	assert.equal(sent[0][10], 1)
+	assert.equal(sent[1].readFloatLE(6).toFixed(1), '-4.5')
+	assert.equal(sent[1][10], 1)
 	assert.equal(reads.at(-1).muted, true)
 
-	// The poll confirms the new state; toggling again unmutes.
-	gains.set('1:4', { gainDb: -4.5, muted: true })
+	// A second press reads the device state written by the first transaction,
+	// then toggles it back rather than relying on the feedback cache.
 	sent.length = 0
 	await actions.mute_this_channel.callback({ controlId: 'ctrl9', options: { mode: 'toggle' } })
-	assert.equal(sent[0][10], 0)
+	assert.deepEqual(
+		sent.map((command) => command[0]),
+		[0x21, 0x01],
+	)
+	assert.equal(sent[1][10], 0)
 
-	// Unknown control or channel never read → nothing sent.
+	// The standalone action has the same fresh-read behaviour.
+	sent.length = 0
+	await actions.set_channel_mute.callback({
+		controlId: 'standalone',
+		options: { channelType: ChannelType.OutputDsp, channel: 5, mode: 'mute' },
+	})
+	assert.deepEqual(
+		sent.map((command) => command[0]),
+		[0x21, 0x01],
+	)
+	assert.equal(sent[1][10], 1)
+
+	// Unknown button target still does not talk to the device.
 	sent.length = 0
 	await actions.mute_this_channel.callback({ controlId: 'nope', options: { mode: 'toggle' } })
-	gains.clear()
-	await actions.mute_this_channel.callback({ controlId: 'ctrl9', options: { mode: 'toggle' } })
 	assert.deepEqual(sent, [])
 })
 
-test('failed gain and mute writes do not optimistically replace the cached device state', async () => {
+test('gain mutations use the bounded full-preset timeout without relaxing control writes', async () => {
+	const calls = []
+	const rawClient = {
+		sendCommandExpect: async (cmd, options) => {
+			calls.push({ cmd: Buffer.from(cmd), options })
+			if (cmd[0] === 0x21) return presetAudioResult(options, [{ gainDb: -6, muted: false }])
+			return { success: true, rx: Buffer.from('3300', 'hex') }
+		},
+	}
+	const client = bindActionClient(rawClient, SETTINGS.commandTimeoutMs, SETTINGS.actionQueueTtlMs)
+	const actions = getActionDefinitions(client, { log: () => undefined })
+
+	await actions.adjust_gain.callback({
+		options: { channelType: ChannelType.InputDsp, channel: 1, direction: 'up', deltaDb: 1 },
+	})
+
+	assert.deepEqual(
+		calls.map(({ cmd }) => cmd[0]),
+		[0x21, 0x01],
+	)
+	assert.equal(calls[0].options.timeoutMs, SETTINGS.presetAudioTimeoutMs)
+	assert.equal(calls[1].options.timeoutMs, SETTINGS.commandTimeoutMs)
+	assert.equal(calls[0].options.queueTtlMs, SETTINGS.actionQueueTtlMs)
+	assert.equal(calls[1].options.queueTtlMs, SETTINGS.actionQueueTtlMs)
+})
+
+test('failed gain and mute writes keep the freshly-read device state', async () => {
+	const sent = []
+	const current = { gainDb: -4.5, muted: false }
 	const client = {
-		sendCommandExpect: async () => ({ success: false, rx: Buffer.from('6600', 'hex'), error: 'device returned error' }),
+		sendCommandExpect: async (cmd, options) => {
+			sent.push(Buffer.from(cmd))
+			if (cmd[0] === 0x21) {
+				const outputDsp = []
+				outputDsp[4] = current
+				return presetAudioResult(options, [], outputDsp)
+			}
+			return { success: false, rx: Buffer.from('6600', 'hex'), error: 'device returned error' }
+		},
 	}
 	const reads = []
 	const logger = {
@@ -1136,29 +1649,25 @@ test('failed gain and mute writes do not optimistically replace the cached devic
 		reportActionResult: () => undefined,
 		reportGainRead: (_type, _index, read) => reads.push(read),
 	}
-	const gains = new Map([['1:4', { gainDb: -4.5, muted: false }]])
 	const muteTargets = new Map([['ctrl9', { channelType: 1, channelIndex: 4 }]])
-	const actions = getActionDefinitions(
-		client,
-		logger,
-		new Map(),
-		new Map(),
-		[],
-		new Map(),
-		muteTargets,
-		(type, index) => gains.get(`${type}:${index}`),
-	)
+	const actions = getActionDefinitions(client, logger, new Map(), new Map(), [], new Map(), muteTargets)
 	await actions.mute_this_channel.callback({ controlId: 'ctrl9', options: { mode: 'toggle' } })
 	await actions.adjust_gain.callback({
 		options: { channelType: 1, channel: 5, direction: 'up', deltaDb: 1 },
 	})
-	assert.deepEqual(reads, [])
+	assert.deepEqual(
+		sent.map((command) => command[0]),
+		[0x21, 0x01, 0x21, 0x01],
+	)
+	// The fresh reads may refresh feedbacks, but the rejected writes never
+	// publish the requested mute/gain value optimistically.
+	assert.deepEqual(reads, [current, current])
 })
 
 test('legacy mute feedback and protocol-indexed variable IDs remain available', () => {
 	const defs = getFeedbackDefinitions(() => ({}))
 	assert.equal(defs.mute_active.callback({ options: {} }), false)
-	assert.equal('preset_active' in defs, false)
+	assert.equal(defs.preset_active.callback({ options: { preset: 42 } }), false)
 
 	const ids = new Set(getVariableDefinitions().map((definition) => definition.variableId))
 	assert.equal(ids.has('current_preset'), false)
@@ -1185,11 +1694,16 @@ test('a command timeout marks the connection as lost (pulled-cable detection)', 
 	// Each connect() builds a fresh socket, exactly like the real TCPHelper factory.
 	const sockets = []
 	const events = []
-	const client = new NewtonTcpClient('newton', 6668, () => {
-		const socket = new FakeSocket()
-		sockets.push(socket)
-		return socket
-	})
+	const client = new NewtonTcpClient(
+		'newton',
+		6668,
+		() => {
+			const socket = new FakeSocket()
+			sockets.push(socket)
+			return socket
+		},
+		15,
+	)
 	client.on('disconnected', () => events.push('disconnected'))
 	client.on('connected', () => events.push('connected'))
 	client.connect()
@@ -1201,7 +1715,9 @@ test('a command timeout marks the connection as lost (pulled-cable detection)', 
 	const pending = client.sendCommandExpect(Buffer.from('0100', 'hex'), { timeoutMs: 30 })
 	await assert.rejects(pending, /timeout/)
 	assert.deepEqual(events, ['connected', 'disconnected'])
-	assert.equal(sockets.length, 2) // old socket destroyed, a new one is retrying
+	assert.equal(sockets.length, 1) // old socket destroyed; retry is deliberately delayed
+	await sleep(20)
+	assert.equal(sockets.length, 2)
 
 	// When the device is back, the normal connected flow resumes.
 	sockets.at(-1).emit('connect')
@@ -1275,11 +1791,20 @@ test('builds the 0x21 request and parses gain/mute banks from the audio preset b
 	assert.equal(parsePresetAudioGains(err), null)
 })
 
-test('level up/down nudges the cached gain and writes it back', async () => {
+test('level up/down reads fresh 0x21 state, ignores stale cache, and writes it back', async () => {
 	const sent = []
+	const inputDsp = []
+	const outputDsp = []
+	inputDsp[0] = { gainDb: 11.5, muted: false }
+	outputDsp[2] = { gainDb: -6, muted: false }
 	const client = {
-		sendCommandExpect: async (cmd) => {
+		sendCommandExpect: async (cmd, options) => {
 			sent.push(Buffer.from(cmd))
+			if (cmd[0] === 0x21) return presetAudioResult(options, inputDsp, outputDsp)
+			if (cmd[0] === 0x01) {
+				const bank = cmd[1] === ChannelType.InputDsp ? inputDsp : outputDsp
+				bank[cmd.readInt32LE(2)] = { gainDb: cmd.readFloatLE(6), muted: cmd[10] !== 0 }
+			}
 			return { success: true, rx: Buffer.from('3300', 'hex') }
 		},
 	}
@@ -1287,51 +1812,79 @@ test('level up/down nudges the cached gain and writes it back', async () => {
 	const logger = {
 		log: () => undefined,
 		reportActionResult: () => undefined,
-		reportGainRead: (t, i, s) => reads.push(s),
+		reportGainRead: (_type, _index, state) => reads.push(state),
 	}
-	// Cached state comes from the interactivity-controlled 0x21 audio-preset poll (no 0x01 "get").
-	const gains = new Map([
-		['1:2', { gainDb: -6, muted: false }],
-		['0:0', { gainDb: 11.5, muted: false }],
-	])
-	const getGainRead = (t, i) => gains.get(`${t}:${i}`)
-	const actions = getActionDefinitions(client, logger, new Map(), new Map(), [], new Map(), new Map(), getGainRead)
+	// Deliberately stale conflicting cache: Level must use the live 0x21 value.
+	const actions = getActionDefinitions(client, logger, new Map(), new Map(), [], new Map(), new Map(), () => ({
+		gainDb: -70,
+		muted: true,
+	}))
 
 	await actions.adjust_gain.callback({
-		options: { channelType: 1, channel: 3, direction: 'up', deltaDb: 2.5 },
+		options: { channelType: ChannelType.OutputDsp, channel: 3, direction: 'up', deltaDb: 2.5 },
 	})
-	// One single Set Gain write, no read round-trips.
 	assert.deepEqual(
-		sent.map((c) => c.length),
-		[11],
+		sent.map((command) => command[0]),
+		[0x21, 0x01],
 	)
-	assert.equal(sent[0][1], 1) // Output DSP
-	assert.equal(sent[0].readInt32LE(2), 2) // channel 3 → protocol 2
-	assert.equal(sent[0].readFloatLE(6).toFixed(1), '-3.5') // -6 + 2.5
-	assert.equal(sent[0][10], 0) // mute preserved
+	assert.equal(sent[1][1], ChannelType.OutputDsp)
+	assert.equal(sent[1].readInt32LE(2), 2) // UI channel 3 -> wire index 2
+	assert.equal(sent[1].readFloatLE(6).toFixed(1), '-3.5') // fresh -6 + 2.5
+	assert.equal(sent[1][10], 0) // fresh mute state, not stale cache true
 	assert.equal(reads.at(-1).gainDb.toFixed(1), '-3.5')
 
 	// Clamped at +6 upward.
 	sent.length = 0
 	await actions.adjust_gain.callback({
-		options: { channelType: 0, channel: 1, direction: 'up', deltaDb: 24 },
+		options: { channelType: ChannelType.InputDsp, channel: 1, direction: 'up', deltaDb: 24 },
 	})
-	assert.equal(sent[0].readFloatLE(6).toFixed(1), '6.0')
+	assert.equal(sent[1].readFloatLE(6).toFixed(1), '6.0')
 
-	// Down direction subtracts.
+	// Down direction subtracts from a new live device value.
 	sent.length = 0
-	gains.set('0:0', { gainDb: -6, muted: false })
+	inputDsp[0] = { gainDb: -6, muted: false }
 	await actions.adjust_gain.callback({
-		options: { channelType: 0, channel: 1, direction: 'down', deltaDb: 1 },
+		options: { channelType: ChannelType.InputDsp, channel: 1, direction: 'down', deltaDb: 1 },
 	})
-	assert.equal(sent[0].readFloatLE(6).toFixed(1), '-7.0')
+	assert.equal(sent[1].readFloatLE(6).toFixed(1), '-7.0')
 
-	// Channel never read yet → refuse to write blindly.
+	// Invalid parsed state refuses to write blindly after the 0x21 read.
 	sent.length = 0
+	inputDsp[8] = { gainDb: Number.NaN, muted: false }
 	await actions.adjust_gain.callback({
-		options: { channelType: 0, channel: 9, direction: 'up', deltaDb: 1 },
+		options: { channelType: ChannelType.InputDsp, channel: 9, direction: 'up', deltaDb: 1 },
 	})
-	assert.deepEqual(sent, [])
+	assert.deepEqual(
+		sent.map((command) => command[0]),
+		[0x21],
+	)
+})
+
+test('concurrent level presses are serialized per channel around fresh read-modify-write', async () => {
+	const sent = []
+	let inputState = { gainDb: -6, muted: false }
+	const client = {
+		sendCommandExpect: async (cmd, options) => {
+			sent.push(Buffer.from(cmd))
+			if (cmd[0] === 0x21) return presetAudioResult(options, [inputState])
+			if (cmd[0] === 0x01) inputState = { gainDb: cmd.readFloatLE(6), muted: cmd[10] !== 0 }
+			return { success: true, rx: Buffer.from('3300', 'hex') }
+		},
+	}
+	const actions = getActionDefinitions(client, { log: () => undefined }, new Map(), new Map(), [], new Map(), new Map())
+	const press = () =>
+		actions.adjust_gain.callback({
+			options: { channelType: ChannelType.InputDsp, channel: 1, direction: 'up', deltaDb: 1 },
+		})
+
+	await Promise.all([press(), press()])
+	assert.deepEqual(
+		sent.map((command) => command[0]),
+		[0x21, 0x01, 0x21, 0x01],
+	)
+	assert.equal(sent[1].readFloatLE(6), -5)
+	assert.equal(sent[3].readFloatLE(6), -4)
+	assert.equal(inputState.gainDb, -4)
 })
 
 test('meter feedback reads the peak or rms bank per the selected mode', () => {
@@ -1430,7 +1983,7 @@ test('a legacy [66 00] rejects fixed-length reads without reconnecting', async (
 
 	const rejected = client.sendCommandExpect(Buffer.from('91336600', 'hex'), {
 		name: 'Read Priority List',
-		timeoutMs: 200,
+		timeoutMs: 60,
 		expectedLength: 6,
 		isSuccess: (data) => data.length === 6,
 	})
@@ -1450,14 +2003,16 @@ test('a legacy [66 00] rejects fixed-length reads without reconnecting', async (
 	client.destroy()
 })
 
-test('a fragmented raw fixed-length reply beginning with [66 00] is not mistaken for an error', async () => {
+test('a fragmented raw fixed-length reply beginning with [66 00] survives a gap over 30 ms', async () => {
 	const messages = []
 	const accumulator = new MessageAccumulator(
 		(data) => messages.push(Buffer.from(data)),
 		() => undefined,
 	)
-	accumulator.setResponseFraming('legacyFixedLength', 6, true)
+	accumulator.setResponseFraming('legacyFixedLength', 6)
 	accumulator.feed(Buffer.from('6600', 'hex'))
+	await sleep(50)
+	assert.deepEqual(messages, [])
 	accumulator.feed(Buffer.from('01020304', 'hex'))
 	assert.deepEqual(messages, [Buffer.from('660001020304', 'hex')])
 })
@@ -1478,7 +2033,7 @@ test('snapshot actions fail fast on pre-0.98 firmware without sending', async ()
 		logger,
 		new Map(),
 		new Map(),
-		[],
+		[{ uuid: 'uuid-1', name: 'Cached snapshot' }],
 		snapshotTargets,
 		new Map(),
 		() => undefined,
@@ -1526,11 +2081,16 @@ test('every gain write is clamped to the device-safe -80..+6 dB window', async (
 	assert.equal(fader.readFloatLE(2), 6)
 	assert.equal(fader.readFloatLE(6), -80)
 
-	// A mute toggle must not echo an out-of-range cached device gain.
+	// A mute toggle must not echo an out-of-range device gain read from 0x21.
 	const sent = []
 	const client = {
-		sendCommandExpect: async (cmd) => {
+		sendCommandExpect: async (cmd, options) => {
 			sent.push(Buffer.from(cmd))
+			if (cmd[0] === 0x21) {
+				const outputDsp = []
+				outputDsp[4] = { gainDb: -90, muted: false }
+				return presetAudioResult(options, [], outputDsp)
+			}
 			return { success: true, rx: Buffer.from('3300', 'hex') }
 		},
 	}
@@ -1540,21 +2100,87 @@ test('every gain write is clamped to the device-safe -80..+6 dB window', async (
 		reportActionResult: () => undefined,
 		reportGainRead: (t, i, s) => reads.push(s),
 	}
-	const gains = new Map([['1:4', { gainDb: -90, muted: false }]])
-	const getGainRead = (t, i) => gains.get(`${t}:${i}`)
 	const muteTargets = new Map([['ctrl9', { channelType: 1, channelIndex: 4 }]])
-	const actions = getActionDefinitions(client, logger, new Map(), new Map(), [], new Map(), muteTargets, getGainRead)
+	const actions = getActionDefinitions(client, logger, new Map(), new Map(), [], new Map(), muteTargets)
+	const setGainChannelOption = actions.set_gain.options.find((option) => option.id === 'channelIndex')
+	assert.deepEqual(
+		{
+			label: setGainChannelOption.label,
+			default: setGainChannelOption.default,
+			min: setGainChannelOption.min,
+			max: setGainChannelOption.max,
+		},
+		{ label: 'Channel (1-based; range depends on type)', default: 1, min: 1, max: 288 },
+	)
 	await actions.mute_this_channel.callback({ controlId: 'ctrl9', options: { mode: 'toggle' } })
-	assert.equal(sent[0].readFloatLE(6), -80)
-	assert.equal(sent[0][10], 1)
+	assert.equal(sent[1].readFloatLE(6), -80)
+	assert.equal(sent[1][10], 1)
 	assert.equal(reads.at(-1).gainDb, -80)
 
 	// Set Gain clamps trigger-injected values before building.
 	sent.length = 0
 	await actions.set_gain.callback({
-		options: { channelType: 0, channelIndex: 0, gainDb: 18, mute: false },
+		options: { channelType: 0, channelIndex: 1, gainDb: 18, mute: false },
 	})
 	assert.equal(sent[0].readFloatLE(6), 6)
+	assert.equal(sent[0].readInt32LE(2), 0)
+
+	// The last UI channel follows the same conversion: 288 becomes wire index 287.
+	sent.length = 0
+	await actions.set_gain.callback({
+		options: { channelType: ChannelType.MatrixMixer, channelIndex: 288, gainDb: 0, mute: false },
+	})
+	assert.equal(sent[0].readInt32LE(2), 287)
+
+	// UI channels are strictly 1-based; an injected zero must never reach Newton.
+	sent.length = 0
+	await actions.set_gain.callback({
+		options: { channelType: 0, channelIndex: 0, gainDb: 0, mute: false },
+	})
+	assert.deepEqual(sent, [])
+
+	// Set Gain validates each documented bank in the 1-based operator UI and
+	// converts the accepted final channel to the matching zero-based wire index.
+	for (const [channelType, channelCount] of [
+		[ChannelType.InputDsp, 16],
+		[ChannelType.OutputDsp, 16],
+		[ChannelType.AuxMixer, 10],
+		[ChannelType.MatrixMixer, 288],
+		[ChannelType.Trimmer, 64],
+		[ChannelType.OutputGroup, 64],
+	]) {
+		sent.length = 0
+		await actions.set_gain.callback({
+			options: { channelType, channelIndex: channelCount, gainDb: 0, mute: false },
+		})
+		assert.equal(sent.length, 1)
+		assert.equal(sent[0].readInt32LE(2), channelCount - 1)
+
+		await actions.set_gain.callback({
+			options: { channelType, channelIndex: channelCount + 1, gainDb: 0, mute: false },
+		})
+		assert.equal(sent.length, 1, `channel ${channelCount + 1} must be rejected for type ${channelType}`)
+	}
+})
+
+test('Set Gain migration preserves the target while changing the saved option to 1-based', () => {
+	const props = {
+		config: null,
+		actions: [
+			{ id: 'g0', controlId: 'c0', actionId: 'set_gain', options: { channelType: 0, channelIndex: 0 } },
+			{ id: 'g287', controlId: 'c1', actionId: 'set_gain', options: { channelType: 3, channelIndex: 287 } },
+			{ id: 'other', controlId: 'c2', actionId: 'adjust_gain', options: { channel: 1 } },
+		],
+		feedbacks: [],
+	}
+	const upgraded = UpgradeScripts.map((script) => script({ currentConfig: {} }, props)).find((result) =>
+		result.updatedActions.some((action) => action.id === 'g0' && action.options.channelIndex === 1),
+	)
+	assert.ok(upgraded, 'expected a Set Gain one-based migration script')
+	assert.deepEqual(
+		upgraded.updatedActions.map((action) => action.options.channelIndex),
+		[1, 288],
+	)
 })
 
 test('scope option restores module-wide status lamps and the upgrade marks pre-scope feedbacks global', () => {
@@ -1581,23 +2207,24 @@ test('scope option restores module-wide status lamps and the upgrade marks pre-s
 	)
 
 	// Feedbacks saved before the option existed are migrated to 'global'.
-	const upgraded = UpgradeScripts.at(-1)(
-		{ currentConfig: {} },
-		{
-			config: null,
-			actions: [],
-			feedbacks: [
-				{ id: 'f1', controlId: 'c1', feedbackId: 'last_action_error', options: { actionName: '' } },
-				{
-					id: 'f2',
-					controlId: 'c2',
-					feedbackId: 'last_action_success',
-					options: { actionName: 'Set Gain', scope: 'this' },
-				},
-				{ id: 'f3', controlId: 'c3', feedbackId: 'input_patch_monitor', options: {} },
-			],
-		},
+	const props = {
+		config: null,
+		actions: [],
+		feedbacks: [
+			{ id: 'f1', controlId: 'c1', feedbackId: 'last_action_error', options: { actionName: '' } },
+			{
+				id: 'f2',
+				controlId: 'c2',
+				feedbackId: 'last_action_success',
+				options: { actionName: 'Set Gain', scope: 'this' },
+			},
+			{ id: 'f3', controlId: 'c3', feedbackId: 'input_patch_monitor', options: {} },
+		],
+	}
+	const upgraded = UpgradeScripts.map((script) => script({ currentConfig: {} }, props)).find((result) =>
+		result.updatedFeedbacks.some((feedback) => feedback.id === 'f1' && feedback.options.scope === 'global'),
 	)
+	assert.ok(upgraded, 'expected a last-action scope migration script')
 	assert.equal(upgraded.updatedFeedbacks.length, 1)
 	assert.equal(upgraded.updatedFeedbacks[0].id, 'f1')
 	assert.equal(upgraded.updatedFeedbacks[0].options.scope, 'global')
@@ -1605,13 +2232,14 @@ test('scope option restores module-wide status lamps and the upgrade marks pre-s
 
 test('snapshot label shows a loading state and keeps its target until the database is read', () => {
 	const snapshotTargets = new Map()
+	const cachedSnapshots = [{ uuid: 'uuid-1', name: 'Cached name' }]
 	const label = getFeedbackDefinitions(
 		() => ({ snapshotDatabaseLoaded: false }),
 		new Map(),
 		new Map(),
 		new Map(),
 		snapshotTargets,
-		[],
+		cachedSnapshots,
 	).snapshot_apply_label
 
 	// Valid uuid, database not read yet: not "missing", and the target stays
@@ -1623,22 +2251,103 @@ test('snapshot label shows a loading state and keeps its target until the databa
 
 	// The apply action fails soft (retry) instead of claiming deletion.
 	const reports = []
+	const sent = []
 	const actions = getActionDefinitions(
-		{ sendCommandExpect: async () => ({ success: true, rx: Buffer.alloc(0) }) },
+		{
+			sendCommandExpect: async (cmd) => {
+				sent.push(Buffer.from(cmd))
+				return { success: true, rx: Buffer.alloc(0) }
+			},
+		},
 		{ log: () => undefined, reportActionResult: (result) => reports.push(result) },
 		new Map(),
 		new Map(),
-		[],
+		cachedSnapshots,
 		snapshotTargets,
 		new Map(),
 		() => undefined,
 		() => false,
 		() => false,
 	)
-	return actions.apply_this_snapshot
-		.callback({ controlId: 'b1', options: { fadingTime: 2000, mode: 'Direct' } })
-		.then(() => {
-			assert.match(reports.at(-1).error, /not been read/)
-			assert.equal(snapshotTargets.has('b1'), true)
-		})
+	return Promise.all([
+		actions.apply_this_snapshot.callback({ controlId: 'b1', options: { fadingTime: 2000, mode: 'Direct' } }),
+		actions.snapshot_apply_selected.callback({
+			controlId: 'b2',
+			options: { uuid: 'uuid-1', fadingTime: 2000, mode: 'Direct' },
+		}),
+	]).then(() => {
+		assert.equal(reports.length, 2)
+		assert.ok(reports.every((result) => /not been read/.test(result.error)))
+		assert.equal(snapshotTargets.has('b1'), true)
+		assert.deepEqual(sent, [])
+	})
+})
+
+test('queue-governance rejections are typed so callers can tell backpressure from failures', async () => {
+	const socket = new FakeSocket()
+	const client = new NewtonTcpClient('newton', 6668, () => socket)
+	client.connect()
+	socket.emit('connect')
+
+	// Occupy the active slot with a long read that never answers.
+	const active = client.sendCommandExpect(Buffer.from('2133', 'hex'), {
+		name: 'long transfer',
+		timeoutMs: 500,
+		expectedLength: 1024,
+	})
+	await sleep(0)
+	const queued = client.sendCommandExpect(Buffer.from('91336600', 'hex'), {
+		name: 'poll behind transfer',
+		timeoutMs: 300,
+		queueTtlMs: 15,
+		expectedLength: 6,
+		priority: 'poll',
+	})
+	await assert.rejects(queued, (err) => isQueueRejection(err) && /expired in command queue/.test(err.message))
+	// The expiry is pure backpressure: active command and socket are untouched.
+	assert.equal(socket.destroyed, false)
+	client.destroy()
+	await assert.rejects(active, /destroyed/)
+	// Ordinary failures stay untyped.
+	assert.equal(isQueueRejection(new Error('expired in command queue')), false)
+})
+
+test('preset audio read options are shared and carry the long transfer deadline', () => {
+	const options = presetAudioReadOptions()
+	assert.equal(options.timeoutMs, SETTINGS.presetAudioTimeoutMs)
+	assert.equal(options.expectedLength, PRESET_AUDIO_RESPONSE_LENGTH)
+	assert.equal(options.isSuccess(Buffer.alloc(PRESET_AUDIO_RESPONSE_LENGTH, 0x33)), true)
+	assert.equal(options.isSuccess(Buffer.alloc(10, 0x33)), false)
+	// The action queue TTL must always outlive one full transfer.
+	assert.ok(SETTINGS.actionQueueTtlMs > SETTINGS.presetAudioTimeoutMs)
+})
+
+test('isLegacyErrResponse accepts only the bare two-byte rejection', () => {
+	assert.equal(isLegacyErrResponse(Buffer.from('6600', 'hex')), true)
+	assert.equal(isLegacyErrResponse(Buffer.from('3300', 'hex')), false)
+	assert.equal(isLegacyErrResponse(Buffer.from('660000', 'hex')), false)
+	assert.equal(isLegacyErrResponse(Buffer.from('66', 'hex')), false)
+})
+
+test('the reconnect backoff ladder starts fast after a first timeout', async () => {
+	const sockets = []
+	const client = new NewtonTcpClient(
+		'newton',
+		6668,
+		() => {
+			const socket = new FakeSocket()
+			sockets.push(socket)
+			return socket
+		},
+		80,
+	)
+	client.connect()
+	sockets[0].emit('connect')
+	const first = client.sendCommandExpect(Buffer.from('0100', 'hex'), { name: 'blip', timeoutMs: 10 })
+	await assert.rejects(first, /blip timeout/)
+	assert.equal(sockets.length, 1)
+	// First retry fires at ~max/8 (10 ms), not at the full 80 ms ceiling.
+	await sleep(35)
+	assert.equal(sockets.length, 2)
+	client.destroy()
 })

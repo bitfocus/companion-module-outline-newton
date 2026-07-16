@@ -3,7 +3,7 @@
 	"id": "outline-newton",
 	"name": "Outline Newton",
 	"shortname": "Newton",
-	"description": "Control Outline Newton via TCP 6668 with real-time meter polling over UDP 6667",
+	"description": "Control the Outline Newton audio signal matrix and hub via TCP 6668 with real-time meter polling over UDP 6667",
 	"version": "1.0.0",
 	"license": "MIT",
 	"repository": "git+https://github.com/bitfocus/companion-module-outline-newton.git",
@@ -22,12 +22,6 @@
 	},
 	"legacyIds": [],
 	"manufacturer": "Outline",
-	"products": [
-		"Newton"
-	],
-	"keywords": [
-		"dsp",
-		"audio",
-		"processor"
-	]
+	"products": ["Newton"],
+	"keywords": ["audio", "matrix", "signal-routing", "hub"]
 }

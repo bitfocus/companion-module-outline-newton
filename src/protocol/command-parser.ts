@@ -44,6 +44,21 @@ export function parseLegacyResponse(data: Buffer): LegacyResponse {
 }
 
 /**
+ * Return true only for a complete, bare legacy acknowledgement. Several
+ * Newton reads are raw fixed-length payloads whose first byte is arbitrary;
+ * they must not be mistaken for a 0x33/0x66 status reply just because their
+ * first one or two bytes happen to match an acknowledgement prefix.
+ */
+export function isLegacyAckResponse(data: Buffer): boolean {
+	return data.length === LEGACY_HEADER_SIZE && data[1] === 0x00 && (data[0] === REPLY_OK || data[0] === REPLY_ERR)
+}
+
+/** True only for the bare two-byte legacy rejection [0x66, 0x00]. */
+export function isLegacyErrResponse(data: Buffer): boolean {
+	return isLegacyAckResponse(data) && data[0] === REPLY_ERR
+}
+
+/**
  * Parse an SPR (Special Protocol Reply) message.
  *
  * Structure:
@@ -139,10 +154,9 @@ export type ResponseFraming = 'legacyFixedLength' | 'legacyCoalesced' | 'spr'
  *
  * - Special Protocol messages (SPR, prefix 0xF1) carry a length field and
  *   are emitted exactly when their declared length has arrived.
- * - Legacy responses have no length field; we coalesce incoming bytes for a
- *   short inactivity window and then flush, which lets large responses
- *   (e.g. 1024-byte 0x2B signals blob) reassemble correctly even when split
- *   across multiple TCP segments.
+ * - Fixed-length legacy responses are emitted only when their command-specific
+ *   size has arrived. Unknown-length legacy responses use a short inactivity
+ *   window for compatibility.
  */
 export class MessageAccumulator {
 	private chunks: Buffer[] = []
@@ -153,8 +167,8 @@ export class MessageAccumulator {
 	private framing: ResponseFraming = 'legacyCoalesced'
 	private expectedLegacyLength = 0
 	// Some fixed-size legacy reads return a bare [0x66, 0x00] when the
-	// feature is unsupported. This must be explicitly enabled by the caller:
-	// raw replies can legitimately start with the same two bytes.
+	// feature is unsupported. A raw reply can legitimately start with those
+	// bytes, so fixed framing keeps them buffered until the command timeout.
 	// In SPR framing, a legacy [0x33/0x66, 0x00] is accepted only as the very
 	// first reply of the turn (pre-0.98 firmware rejecting an SPC command);
 	// once real SPR bytes are seen, stray status-looking pairs stay junk.
@@ -204,6 +218,26 @@ export class MessageAccumulator {
 		this.processBuffer()
 	}
 
+	/**
+	 * At a fixed-length command's timeout boundary, accept an otherwise
+	 * ambiguous bare [0x66, 0x00] as the complete device rejection. Waiting
+	 * until this boundary prevents a delayed continuation of a valid raw reply
+	 * from being truncated by the legacy coalescing timer.
+	 */
+	flushShortLegacyError(): boolean {
+		if (
+			this.framing !== 'legacyFixedLength' ||
+			this.bufferedLength !== LEGACY_HEADER_SIZE ||
+			!isLegacyErrResponse(this.peek(LEGACY_HEADER_SIZE))
+		) {
+			return false
+		}
+
+		this.cancelFlushTimer()
+		this.onLegacyMessage(this.take(LEGACY_HEADER_SIZE))
+		return true
+	}
+
 	private processBuffer(): void {
 		if (this.framing === 'spr') {
 			this.processSPRBuffer()
@@ -223,21 +257,8 @@ export class MessageAccumulator {
 				return
 			}
 
-			// A rejecting firmware sends only [0x66, 0x00]; every fixed-length
-			// read accepts it so a rejection can never escalate into a timeout
-			// teardown. Wait one TCP coalescing window before accepting: a valid
-			// raw response may start with these bytes and arrive fragmented. Any
-			// additional byte before the timer expires makes it a normal
-			// fixed-size response again.
-			if (
-				this.bufferedLength === LEGACY_HEADER_SIZE &&
-				this.peek(LEGACY_HEADER_SIZE)[0] === REPLY_ERR &&
-				this.peek(LEGACY_HEADER_SIZE)[1] === 0x00
-			) {
-				this.scheduleFlush()
-				return
-			}
-
+			// Incomplete fixed-length replies, including an ambiguous leading
+			// [0x66, 0x00], remain buffered until more bytes or command timeout.
 			this.cancelFlushTimer()
 			return
 		}
@@ -256,7 +277,7 @@ export class MessageAccumulator {
 			const first = this.peek(1)[0]
 			if (this.sprLegacyReplyWindow && (first === REPLY_OK || first === REPLY_ERR)) {
 				if (this.bufferedLength < LEGACY_HEADER_SIZE) return
-				if (this.peek(LEGACY_HEADER_SIZE)[1] === 0x00) {
+				if (isLegacyAckResponse(this.peek(LEGACY_HEADER_SIZE))) {
 					this.onLegacyMessage(this.take(LEGACY_HEADER_SIZE))
 					continue
 				}

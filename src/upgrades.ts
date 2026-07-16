@@ -248,6 +248,28 @@ export const UpgradeScripts: CompanionStaticUpgradeScript<ModuleConfig>[] = [
 		_context: CompanionUpgradeContext<ModuleConfig>,
 		props: CompanionStaticUpgradeProps<ModuleConfig>,
 	): CompanionStaticUpgradeResult<ModuleConfig> => {
+		// Set Gain was the last operator-facing action exposing Newton's raw
+		// zero-based channel index. Preserve the physical target while moving the
+		// saved UI value to the new one-based Channel field.
+		const updatedActions: CompanionMigrationAction[] = []
+		for (const action of props.actions) {
+			if (action.actionId !== 'set_gain') continue
+			const channelIndex = Number(action.options.channelIndex)
+			updatedActions.push({
+				...action,
+				options: {
+					...action.options,
+					channelIndex:
+						Number.isInteger(channelIndex) && channelIndex >= 0 && channelIndex <= 287 ? channelIndex + 1 : 1,
+				},
+			})
+		}
+		return { updatedConfig: null, updatedActions, updatedFeedbacks: [] }
+	},
+	(
+		_context: CompanionUpgradeContext<ModuleConfig>,
+		props: CompanionStaticUpgradeProps<ModuleConfig>,
+	): CompanionStaticUpgradeResult<ModuleConfig> => {
 		// The last-action feedbacks gained a scope option and now default to
 		// watching only their own button. Feedbacks saved before the option
 		// existed relied on the module-wide behaviour of 1.0.0: keep it for them.

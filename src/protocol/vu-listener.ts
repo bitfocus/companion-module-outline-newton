@@ -34,6 +34,7 @@ export interface VuLevels {
 
 interface UdpRemoteInfo {
 	address?: string
+	port?: number
 }
 
 /**
@@ -108,9 +109,11 @@ export class VuListener extends EventEmitter<VuListenerEvents> {
 	}
 
 	private isExpectedSource(rinfo?: UdpRemoteInfo): boolean {
-		// An IP target can be checked exactly. For a DNS host we let the UDP
-		// helper resolve it and retain payload-length validation instead.
-		return isIP(this.host) === 0 || !rinfo?.address || rinfo.address === this.host
+		// Responses must come from Newton's meter server port. For an IP target
+		// validate the peer address as well; for a DNS target UDPHelper resolves
+		// the host, so the source port and packet shape remain the reliable guard.
+		if (rinfo?.port !== this.port) return false
+		return isIP(this.host) === 0 || rinfo.address === this.host
 	}
 }
 
