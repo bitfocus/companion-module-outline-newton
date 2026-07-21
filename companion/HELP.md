@@ -75,7 +75,7 @@ Per-channel values are also published as `$(outline-newton:vu_input_1)`..`vu_inp
 ## Variables
 
 - `$(outline-newton:connection_state)`: `Connected` or `Disconnected`.
-- `$(outline-newton:priority_input_1)`..`priority_input_16` and `priority_aux_input_1`..`priority_aux_input_8`: active source per priority patch (preferred 1-based names).
+- `$(outline-newton:priority_input_1)`..`priority_input_16` and `priority_aux_input_1`..`priority_aux_input_8`: active source per priority patch, shown with 1-based source numbering (`N/A` when Newton reports no source).
 - `$(outline-newton:vu_input_1)`..`vu_input_16` and `vu_output_1`..`vu_output_16`: per-channel meter levels (preferred 1-based names).
 - `priority_in_1`..`priority_in_16`, `priority_aux_1`..`priority_aux_8`, `vu_in_1`..`vu_in_16` and `vu_out_1`..`vu_out_16` remain available as 1-based compatibility aliases.
 - `$(outline-newton:snapshot_support)`: `OK`, `Unknown` or `Unsupported by firmware` (firmware < 0.98).

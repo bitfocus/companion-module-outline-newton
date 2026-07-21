@@ -113,6 +113,10 @@ export const SIGNALS_PRIORITY_PATCH_OFFSET = 666
 export const SIGNALS_PRIORITY_PATCH_LENGTH = 24
 export const SIGNALS_INPUT_DSP_PRIORITY_COUNT = 16
 export const SIGNALS_AUX_MIXER_PRIORITY_COUNT = 8
+/** Protocol sentinel used when a priority patch has no active/configured source. */
+export const PRIORITY_SOURCE_NONE = 0xd8
+/** Clock List value used when no processing clock source is selected. */
+export const CLOCK_SOURCE_NONE = 0x0f
 
 // ===== Special Protocol =====
 export const SPC_HEADER = 0xf0
@@ -147,9 +151,9 @@ export const MIN_SNAPSHOT_FIRMWARE = '0.98'
 export const GAIN_MIN_DB = -80
 export const GAIN_MAX_DB = 6
 
-/** Clamp a dB gain to the device-safe write range; non-finite input floors to GAIN_MIN_DB. */
+/** Clamp a finite dB gain to the device-safe write range; malformed values fail closed. */
 export function clampGainDb(gainDb: number): number {
-	if (!Number.isFinite(gainDb)) return GAIN_MIN_DB
+	if (!Number.isFinite(gainDb)) throw new RangeError('Gain must be a finite number')
 	return Math.min(GAIN_MAX_DB, Math.max(GAIN_MIN_DB, gainDb))
 }
 

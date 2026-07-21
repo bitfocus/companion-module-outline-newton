@@ -1,5 +1,12 @@
 import { combineRgb, type CompanionFeedbackDefinitions, type CompanionInputFieldDropdown } from '@companion-module/base'
-import { CLOCK_SOURCE_NAMES, ChannelType, ClockType, MIN_SNAPSHOT_FIRMWARE } from './protocol/constants.js'
+import {
+	CLOCK_SOURCE_NAMES,
+	CLOCK_SOURCE_NONE,
+	ChannelType,
+	ClockType,
+	MIN_SNAPSHOT_FIRMWARE,
+	PRIORITY_SOURCE_NONE,
+} from './protocol/constants.js'
 import { findSnapshot, snapshotPlaceholderLabel } from './snapshots.js'
 import { UI } from './style.js'
 import type { NewtonState, SnapshotInfo } from './protocol/types.js'
@@ -47,6 +54,14 @@ const CLOCK_TYPE_CHOICES = [
 function clockSourceName(value: number | undefined): string {
 	if (value === undefined || value < 0) return '--'
 	return CLOCK_SOURCE_NAMES[value] ?? `CLK ${value}`
+}
+
+function isAvailablePrioritySource(value: number | undefined): value is number {
+	return value !== undefined && Number.isInteger(value) && value >= 0 && value < PRIORITY_SOURCE_NONE
+}
+
+function isAvailableClockSource(value: number | undefined): value is number {
+	return value !== undefined && Number.isInteger(value) && value >= 0 && value < CLOCK_SOURCE_NONE
 }
 
 // Meter bands: below -60 dB everything is dark; from -60 to -40 only the
@@ -400,7 +415,10 @@ export function getFeedbackDefinitions(
 				const text = `IN ${patchNumber}`
 				const active = s.priorityInputDsp[patchNumber - 1]
 				const first = s.priorityLists[patchNumber - 1]?.sources[0]
-				if (active === undefined || active < 0 || first === undefined) {
+				// 0xD8 is Newton's explicit "no source" value. It is unknown from an
+				// operator perspective, never a healthy match even when both fields
+				// contain the same sentinel.
+				if (!isAvailablePrioritySource(active) || !isAvailablePrioritySource(first)) {
 					return { text }
 				}
 				if (active === first) {
@@ -527,7 +545,9 @@ export function getFeedbackDefinitions(
 				const selected = s.clockSelected[clockType]
 				const first = s.clockLists[clockType]?.list[0]
 				const text = `${CLOCK_TYPE_LABELS[clockType]}\n${clockSourceName(selected)}`
-				if (selected === undefined || selected < 0 || first === undefined) {
+				// Clock List value 15 means NONE. Keep the useful label, but do not
+				// paint NONE green/orange as though it were a live clock source.
+				if (!isAvailableClockSource(selected) || !isAvailableClockSource(first)) {
 					return { text }
 				}
 				if (selected === first) {

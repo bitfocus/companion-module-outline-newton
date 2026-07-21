@@ -441,14 +441,24 @@ export function getActionDefinitions(
 					)
 					return
 				}
+				const gainDb = action.options['gainDb']
+				if (typeof gainDb !== 'number' || !Number.isFinite(gainDb)) {
+					reportActionFailure(logger, 'Set Gain', 'gain must be a finite number', action.controlId)
+					return
+				}
+				const mute = action.options['mute']
+				if (typeof mute !== 'boolean') {
+					reportActionFailure(logger, 'Set Gain', 'mute must be a boolean value', action.controlId)
+					return
+				}
 				const params = {
 					channelType,
 					// Operators enter 1-based channels; Newton addresses them from 0.
 					channelIndex: channel - 1,
 					// The UI enforces min/max, but trigger expressions can inject any
 					// number: clamp to the device-safe window before building.
-					gainDb: clampGainDb(Number(action.options['gainDb'])),
-					mute: Boolean(action.options['mute']),
+					gainDb: clampGainDb(gainDb),
+					mute,
 				}
 				await enqueueGainOperation(channelType, params.channelIndex, async () => {
 					const written = await buildAndRunCommand(
@@ -822,8 +832,13 @@ export function getActionDefinitions(
 					reportActionFailure(logger, name, 'amount must be between 0.1 and 24 dB', action.controlId)
 					return
 				}
+				const direction = action.options['direction']
+				if (direction !== 'up' && direction !== 'down') {
+					reportActionFailure(logger, name, 'direction must be Up or Down', action.controlId)
+					return
+				}
 				const channelIndex = channel - 1
-				const signed = action.options['direction'] === 'down' ? -deltaDb : deltaDb
+				const signed = direction === 'down' ? -deltaDb : deltaDb
 				await mutateFreshGain(name, channelType, channelIndex, action.controlId, async (current) => {
 					const gainDb = clampGainDb(current.gainDb + signed)
 					const written = await buildAndRunCommand(

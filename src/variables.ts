@@ -1,8 +1,19 @@
 import type { CompanionVariableDefinition } from '@companion-module/base'
-import { SIGNALS_AUX_MIXER_PRIORITY_COUNT, SIGNALS_INPUT_DSP_PRIORITY_COUNT } from './protocol/constants.js'
+import {
+	PRIORITY_SOURCE_NONE,
+	SIGNALS_AUX_MIXER_PRIORITY_COUNT,
+	SIGNALS_INPUT_DSP_PRIORITY_COUNT,
+} from './protocol/constants.js'
 
 const VU_INPUT_CHANNELS = 16
 const VU_OUTPUT_CHANNELS = 16
+
+/** Convert Newton's zero-based source index to the operator-facing number. */
+export function prioritySourceForOperator(value: number | undefined): number | 'N/A' {
+	return value !== undefined && Number.isInteger(value) && value >= 0 && value < PRIORITY_SOURCE_NONE
+		? value + 1
+		: 'N/A'
+}
 
 export function getVariableDefinitions(): CompanionVariableDefinition[] {
 	const defs: CompanionVariableDefinition[] = [

@@ -10,12 +10,12 @@ import { UpgradeScripts } from './upgrades.js'
 import { getActionDefinitions } from './actions.js'
 import { bindActionClient } from './action-client.js'
 import { getFeedbackDefinitions, gainKey } from './feedbacks.js'
-import { getVariableDefinitions } from './variables.js'
+import { getVariableDefinitions, prioritySourceForOperator } from './variables.js'
 import { getPresetDefinitions } from './presets.js'
 import { parseSnapshotDatabase } from './snapshots.js'
 import { formatBufferDiagnostic, formatStructuredDiagnostic } from './diagnostics.js'
 import { NewtonTcpClient, isQueueRejection } from './protocol/tcp-client.js'
-import { presetAudioReadOptions } from './preset-audio.js'
+import { PresetAudioPollRecovery, presetAudioReadOptions } from './preset-audio.js'
 import {
 	parseClockSelected,
 	parseClockStateResponse,
@@ -212,10 +212,11 @@ class NewtonInstance extends InstanceBase<ModuleConfig> {
 			this.setupDefinitions()
 		} else {
 			this.lastVuPublish = 0
-			this.stopPresetAudioPolling()
 			if (this.config.host) {
 				// VuListener fixes its interval at construction time, so recreate it
-				// for the selected profile without touching TCP.
+				// for the selected profile without touching TCP. The preset-audio
+				// scheduler is restarted below without resetting its single-flight
+				// gate, so an in-flight 0x21 transfer remains the sole active read.
 				this.startVuListener()
 				if (!this.client) this.connectToDevice()
 				else if (this.client.isConnected) this.startPresetAudioPolling()
@@ -239,6 +240,24 @@ class NewtonInstance extends InstanceBase<ModuleConfig> {
 	private resetDeviceState(): void {
 		this.state = createInitialNewtonState()
 		this.lastVuPublish = 0
+		this.identityRefreshPending = true
+		this.identityRead = { description: false, firmware: false, serial: false }
+		this.clearSnapshotDatabaseRetry()
+	}
+
+	/** Invalidate metadata belonging to the device from the previous TCP session. */
+	private resetSessionMetadata(): void {
+		// A reconnect to the same IP can reach a replacement Newton. Never expose
+		// the old unit's identity or snapshot list while the new reads are pending.
+		this.state.deviceName = ''
+		this.state.firmwareVersion = ''
+		this.state.serialNumber = ''
+		this.state.snapshotCount = 0
+		this.state.lastSnapshotResponse = ''
+		this.state.lastAppliedSnapshot = ''
+		this.state.snapshotList = []
+		this.state.snapshotDatabaseLoaded = false
+		this.state.snapshotsUnsupported = false
 		this.identityRefreshPending = true
 		this.identityRead = { description: false, firmware: false, serial: false }
 		this.clearSnapshotDatabaseRetry()
@@ -338,22 +357,17 @@ class NewtonInstance extends InstanceBase<ModuleConfig> {
 
 		client.on('connected', () => {
 			if (!this.isCurrentClient(client)) return
+			this.resetSessionMetadata()
 			this.state.connected = true
-			this.identityRefreshPending = true
 			// A fresh connection may be a different device or firmware: give the
 			// optional 0x91/0x81 list polling and the snapshot support detection
 			// another chance.
 			this.state.priorityListsUnsupported = false
 			this.state.clockListsUnsupported = false
-			this.state.snapshotsUnsupported = false
-			// The snapshot set may have changed while we were away: mark the
-			// database as unconfirmed (labels show a loading state for unknown
-			// uuids) while keeping the last list as best-known dropdown content
-			// until the re-read lands.
-			this.state.snapshotDatabaseLoaded = false
-			this.clearSnapshotDatabaseRetry()
-			// Same address may host a replacement device: re-read the identity.
-			this.identityRead = { description: false, firmware: false, serial: false }
+			// Remove the previous session's snapshot choices immediately. Saved
+			// UUID selections stay in feedback options and are checked again after
+			// this device's database arrives.
+			this.setupDefinitions()
 			this.updateStatus(InstanceStatus.Ok)
 			this.updateVariables()
 			this.checkFeedbacks('connection_status', 'connection_monitor', 'snapshot_apply_label')
@@ -601,10 +615,10 @@ class NewtonInstance extends InstanceBase<ModuleConfig> {
 			})
 			if (!this.isCurrentClient(client) || !r.success) return false
 			const fw = parseImportFirmwareResponse(r.rx)
-			// Same policy as the other identity fields: empty is a valid read,
-			// and a known version is never clobbered by a transient empty reply.
+			// Empty is a valid identity read. It must replace any value belonging
+			// to a previous device at the same address (rendered as "Unknown").
 			if (fw === null) return false
-			if (fw && fw !== this.state.firmwareVersion) {
+			if (fw !== this.state.firmwareVersion) {
 				this.state.firmwareVersion = fw
 				this.updateVariables()
 			}
@@ -742,10 +756,10 @@ class NewtonInstance extends InstanceBase<ModuleConfig> {
 			})
 			if (!this.isCurrentClient(client) || !r.success) return false
 			const name = parseImportDescriptionResponse(r.rx)
-			// An empty-but-valid field is a successful read (rendered "Unknown");
-			// never overwrite a known value with a transient zero-filled reply.
+			// An empty-but-valid field is a successful read and clears any value
+			// belonging to the previous TCP session (rendered as "Unknown").
 			if (name === null) return false
-			if (name && name !== this.state.deviceName) {
+			if (name !== this.state.deviceName) {
 				this.state.deviceName = name
 				this.updateVariables()
 			}
@@ -768,10 +782,10 @@ class NewtonInstance extends InstanceBase<ModuleConfig> {
 			const serial = parseImportSerialResponse(r.rx)
 			// Some Newton units return a correctly framed, zero-filled serial
 			// field when no serial has been provisioned. An empty string is still
-			// a successful identity response; variables render it as "Unknown".
-			// A known serial is never clobbered by a transient empty reply.
+			// a successful identity response; variables render it as "Unknown" and
+			// it clears any serial belonging to the previous TCP session.
 			if (serial === null) return false
-			if (serial && serial !== this.state.serialNumber) {
+			if (serial !== this.state.serialNumber) {
 				this.state.serialNumber = serial
 				this.updateVariables()
 			}
@@ -825,31 +839,33 @@ class NewtonInstance extends InstanceBase<ModuleConfig> {
 	// channel gain/mute state. It is requested only while a level feedback is
 	// subscribed, and its cadence follows the selected interactivity profile.
 	private presetAudioPollTimer: ReturnType<typeof setInterval> | null = null
-	private presetAudioPolling = false
-	private presetAudioFailures = 0
+	private readonly presetAudioRecovery = new PresetAudioPollRecovery()
 
 	private startPresetAudioPolling(): void {
-		this.stopPresetAudioPolling()
+		this.clearPresetAudioPollTimer()
 		this.presetAudioPollTimer = setInterval(() => {
 			void this.pollPresetAudio()
 		}, getInteractivityProfile(this.config.interactivity).presetAudioPollInterval)
 	}
 
-	private stopPresetAudioPolling(): void {
+	private clearPresetAudioPollTimer(): void {
 		if (this.presetAudioPollTimer) {
 			clearInterval(this.presetAudioPollTimer)
 			this.presetAudioPollTimer = null
 		}
-		this.presetAudioPolling = false
-		this.presetAudioFailures = 0
+	}
+
+	private stopPresetAudioPolling(): void {
+		this.clearPresetAudioPollTimer()
+		this.presetAudioRecovery.reset()
 	}
 
 	private async pollPresetAudio(): Promise<void> {
 		const client = this.client
-		if (!client?.isConnected || this.presetAudioPolling || this.gainSubs.size === 0) return
-		if (this.presetAudioFailures >= 2) return
+		if (!client?.isConnected || this.gainSubs.size === 0) return
+		const attempt = this.presetAudioRecovery.begin()
+		if (attempt === null) return
 
-		this.presetAudioPolling = true
 		try {
 			const r = await client.sendCommandExpect(buildImportAudioPresetCommand(), {
 				...presetAudioReadOptions(),
@@ -857,11 +873,13 @@ class NewtonInstance extends InstanceBase<ModuleConfig> {
 			})
 			if (!this.isCurrentClient(client)) return
 			if (!r.success || !r.parsed) {
-				this.registerPresetAudioFailure(r.error ?? 'invalid audio preset response')
+				this.registerPresetAudioFailure(attempt, r.error ?? 'invalid audio preset response')
 				return
 			}
 
-			this.presetAudioFailures = 0
+			const recovery = this.presetAudioRecovery.succeed(attempt)
+			if (!recovery.accepted) return
+			if (recovery.recovered) this.log('info', 'Preset-audio polling recovered')
 			let changed = false
 			const apply = (channelType: number, entries: (GainReadState | null)[]): void => {
 				entries.forEach((entry, channelIndex) => {
@@ -878,25 +896,30 @@ class NewtonInstance extends InstanceBase<ModuleConfig> {
 			apply(Number(ChannelType.OutputDsp), r.parsed.outputDsp)
 			if (changed) this.checkFeedbacks('channel_gain', 'channel_mute')
 		} catch (err) {
-			// A poll evicted or expired behind other work is backpressure, not a
-			// device failure: it must not count towards disabling the poll.
-			if (this.isCurrentClient(client) && !isQueueRejection(err)) {
-				this.registerPresetAudioFailure(err instanceof Error ? err.message : String(err))
+			// A poll evicted, expired or refused by the bounded queue is
+			// backpressure, not a device failure: it must not enter the retry
+			// backoff or clear otherwise valid device state.
+			if (this.isCurrentClient(client)) {
+				if (isQueueRejection(err)) this.presetAudioRecovery.release(attempt)
+				else this.registerPresetAudioFailure(attempt, err instanceof Error ? err.message : String(err))
 			}
 		} finally {
-			if (this.isCurrentClient(client)) this.presetAudioPolling = false
+			// Idempotent, and ignored when a lifecycle reset has already invalidated
+			// this attempt or a newer TCP session owns the gate.
+			this.presetAudioRecovery.release(attempt)
 		}
 	}
 
-	private registerPresetAudioFailure(reason: string): void {
-		this.presetAudioFailures++
-		if (this.presetAudioFailures === 2) {
-			// A disabled poll must not leave stale values available to a later
-			// read-modify-write action. Feedbacks become unknown until a reconnect
-			// re-establishes a fresh 0x21 read.
+	private registerPresetAudioFailure(attempt: number, reason: string): void {
+		const pollInterval = getInteractivityProfile(this.config.interactivity).presetAudioPollInterval
+		const failure = this.presetAudioRecovery.fail(attempt, pollInterval)
+		if (failure.enteredBackoff) {
+			// Stale values must not remain available to a later read-modify-write
+			// action while the device read is degraded. The timer stays armed and
+			// automatically retries through the bounded backoff until it recovers.
 			this.state.gainReads.clear()
 			this.checkFeedbacks('channel_gain', 'channel_mute')
-			this.log('warn', `Preset-audio polling disabled until reconnect: ${reason}`)
+			this.log('warn', `Preset-audio polling temporarily unavailable; retrying with backoff: ${reason}`)
 		}
 	}
 
@@ -1162,13 +1185,13 @@ class NewtonInstance extends InstanceBase<ModuleConfig> {
 		// configurations keep their meaning.
 		for (let i = 0; i < SIGNALS_INPUT_DSP_PRIORITY_COUNT; i++) {
 			const v = this.state.priorityInputDsp[i]
-			const value = v !== undefined && v >= 0 ? v : 'N/A'
+			const value = prioritySourceForOperator(v)
 			vars[`priority_in_${i + 1}`] = value
 			vars[`priority_input_${i + 1}`] = value
 		}
 		for (let i = 0; i < SIGNALS_AUX_MIXER_PRIORITY_COUNT; i++) {
 			const v = this.state.priorityAuxMixer[i]
-			const value = v !== undefined && v >= 0 ? v : 'N/A'
+			const value = prioritySourceForOperator(v)
 			vars[`priority_aux_${i + 1}`] = value
 			vars[`priority_aux_input_${i + 1}`] = value
 		}
@@ -1177,11 +1200,11 @@ class NewtonInstance extends InstanceBase<ModuleConfig> {
 		const selectedPriority = this.state.priorityInputDsp[monitorIndex] ?? -1
 		const selectedList = this.state.priorityLists[monitorIndex] ?? null
 		const selectedHighest = selectedList?.sources[0]
-		vars.priority_selected_active = selectedPriority >= 0 ? selectedPriority : 'N/A'
+		vars.priority_selected_active = prioritySourceForOperator(selectedPriority)
 		// A fixed fallback would turn an unavailable 0x91 list into a seemingly
 		// healthy "no" override. Only report a highest source when the device has
 		// actually supplied one for this patch.
-		vars.priority_selected_highest = selectedHighest ?? 'N/A'
+		vars.priority_selected_highest = prioritySourceForOperator(selectedHighest)
 		vars.priority_selected_forced = selectedList
 			? selectedList.isForced
 				? 'yes'
@@ -1189,9 +1212,11 @@ class NewtonInstance extends InstanceBase<ModuleConfig> {
 			: this.state.priorityListsUnsupported
 				? 'unsupported'
 				: 'unknown'
-		vars.priority_selected_forced_channel = selectedList?.forcedChannel ?? 'N/A'
+		vars.priority_selected_forced_channel = selectedList?.isForced
+			? prioritySourceForOperator(selectedList.forcedChannel)
+			: 'N/A'
 		vars.priority_selected_overridden =
-			selectedPriority < 0 || selectedHighest === undefined
+			prioritySourceForOperator(selectedPriority) === 'N/A' || prioritySourceForOperator(selectedHighest) === 'N/A'
 				? 'unknown'
 				: selectedPriority !== selectedHighest
 					? 'yes'

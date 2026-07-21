@@ -35,14 +35,14 @@ import {
 } from '../dist/protocol/command-parser.js'
 import { verifyCrc16 } from '../dist/protocol/crc16.js'
 import { NewtonTcpClient, isQueueRejection } from '../dist/protocol/tcp-client.js'
-import { presetAudioReadOptions } from '../dist/preset-audio.js'
+import { PresetAudioPollRecovery, presetAudioReadOptions } from '../dist/preset-audio.js'
 import { appendCrc16 } from '../dist/protocol/crc16.js'
 import { decodeStatusMeters, VuListener } from '../dist/protocol/vu-listener.js'
 import { UpgradeScripts } from '../dist/upgrades.js'
 import { getFeedbackDefinitions } from '../dist/feedbacks.js'
 import { getActionDefinitions } from '../dist/actions.js'
 import { parseSnapshotDatabase } from '../dist/snapshots.js'
-import { getVariableDefinitions } from '../dist/variables.js'
+import { getVariableDefinitions, prioritySourceForOperator } from '../dist/variables.js'
 import { SETTINGS, getConfigFields, getInteractivityProfile, normalizeInteractivity } from '../dist/config.js'
 import { bindActionClient } from '../dist/action-client.js'
 import { formatStructuredDiagnostic } from '../dist/diagnostics.js'
@@ -840,6 +840,33 @@ test('TCP rejects excess operator work instead of growing an unbounded command q
 	await Promise.all([activeRejected, ...waitingRejected])
 })
 
+test('TCP reports a full queue as typed backpressure to background pollers', async () => {
+	const socket = new FakeSocket()
+	const client = new NewtonTcpClient('newton', 6668, () => socket)
+	client.connect()
+	socket.emit('connect')
+
+	const active = client.sendCommandExpect(Buffer.from('0100', 'hex'), { timeoutMs: 1000 })
+	const waiting = Array.from({ length: 31 }, (_, index) =>
+		client.sendCommandExpect(Buffer.from([0x02, index]), { timeoutMs: 1000, priority: 'action' }),
+	)
+	const overflowPoll = client.sendCommandExpect(Buffer.from('91336600', 'hex'), {
+		name: 'background poll',
+		timeoutMs: 1000,
+		priority: 'poll',
+	})
+	await assert.rejects(
+		overflowPoll,
+		(err) => isQueueRejection(err) && err.reason === 'full' && /Command queue is full/.test(err.message),
+	)
+	assert.equal(socket.sent.length, 1)
+
+	const activeRejected = assert.rejects(active, /Client destroyed/)
+	const waitingRejected = waiting.map((pending) => assert.rejects(pending, /Client destroyed/))
+	client.destroy()
+	await Promise.all([activeRejected, ...waitingRejected])
+})
+
 test('TCP makes room for an operator action by dropping the oldest queued poll', async () => {
 	const socket = new FakeSocket()
 	const client = new NewtonTcpClient('newton', 6668, () => socket)
@@ -1097,10 +1124,12 @@ test('upgrade drops manual expected-source options from priority feedbacks', () 
 
 test('input patch monitor feedback writes the label and colors from device state', () => {
 	const state = {
-		priorityInputDsp: [9, 5],
+		priorityInputDsp: [9, 5, 216, 255],
 		priorityLists: [
 			{ sources: [9, 1, 216, 216], isForced: false, forcedChannel: 0 },
 			{ sources: [9, 5, 216, 216], isForced: false, forcedChannel: 0 },
+			{ sources: [216, 216, 216, 216], isForced: false, forcedChannel: 0 },
+			{ sources: [255, 216, 216, 216], isForced: false, forcedChannel: 0 },
 		],
 	}
 	const monitor = getFeedbackDefinitions(() => state).input_patch_monitor
@@ -1113,8 +1142,12 @@ test('input patch monitor feedback writes the label and colors from device state
 	assert.equal(orange.text, 'IN 2')
 	assert.notEqual(orange.bgcolor, green.bgcolor)
 
-	// No channel list yet for input 3: label only, neutral colors.
+	// 0xD8 means no source. Matching sentinels must stay neutral, not green.
 	assert.deepEqual(monitor.callback({ options: { patchIndex: 3 } }), { text: 'IN 3' })
+	// Corrupt/out-of-domain source values also stay neutral.
+	assert.deepEqual(monitor.callback({ options: { patchIndex: 4 } }), { text: 'IN 4' })
+	// No channel list yet for input 5: label only, neutral colors.
+	assert.deepEqual(monitor.callback({ options: { patchIndex: 5 } }), { text: 'IN 5' })
 })
 
 test('upgrade converts styled boolean priority feedbacks to the advanced monitor', () => {
@@ -1282,11 +1315,11 @@ test('builds clock get/rearm packets and parses the 19-byte clock state', () => 
 
 test('clock monitor feedback labels the clock and colors from list vs selected', () => {
 	const state = {
-		clockSelected: [2, 4, -1],
+		clockSelected: [2, 4, 15],
 		clockLists: [
 			{ list: [2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 12, 11, 14, 0, 1, 15], isForced: false, forcedIndex: 0, is48: false },
 			{ list: [2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 12, 11, 14, 0, 1, 15], isForced: false, forcedIndex: 0, is48: false },
-			null,
+			{ list: [15, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 12, 11, 14, 0, 1], isForced: false, forcedIndex: 0, is48: false },
 		],
 	}
 	const monitor = getFeedbackDefinitions(() => state).clock_monitor
@@ -1301,8 +1334,12 @@ test('clock monitor feedback labels the clock and colors from list vs selected',
 	assert.equal(orange.text, 'WCK 1\nAES 3-4')
 	assert.notEqual(orange.bgcolor, green.bgcolor)
 
-	// WC Out 2 unknown → neutral label only.
-	assert.deepEqual(monitor.callback({ options: { clockType: 2 } }), { text: 'WCK 2\n--' })
+	// Clock List value 15 means NONE: matching NONE values remain neutral.
+	assert.deepEqual(monitor.callback({ options: { clockType: 2 } }), { text: 'WCK 2\nNONE' })
+	// Out-of-domain bytes must not become a healthy matching clock either.
+	state.clockSelected[2] = 255
+	state.clockLists[2].list[0] = 255
+	assert.deepEqual(monitor.callback({ options: { clockType: 2 } }), { text: 'WCK 2\nCLK 255' })
 })
 
 test('rearm-this-clock action targets the clock registered by the label feedback', async () => {
@@ -1789,6 +1826,11 @@ test('builds the 0x21 request and parses gain/mute banks from the audio preset b
 	const err = Buffer.alloc(PRESET_AUDIO_RESPONSE_LENGTH)
 	err[0] = 0x66
 	assert.equal(parsePresetAudioGains(err), null)
+	const malformedAck = Buffer.alloc(PRESET_AUDIO_RESPONSE_LENGTH)
+	malformedAck[0] = 0x33
+	malformedAck[1] = 0x66
+	assert.equal(parsePresetAudioGains(malformedAck), null)
+	assert.equal(presetAudioReadOptions().isSuccess(malformedAck), false)
 })
 
 test('level up/down reads fresh 0x21 state, ignores stale cache, and writes it back', async () => {
@@ -2071,15 +2113,18 @@ test('snapshot label feedback reports missing firmware support', () => {
 })
 
 test('every gain write is clamped to the device-safe -80..+6 dB window', async () => {
-	// The builder is the choke point: out-of-range and non-finite values.
+	// The builder is the choke point: finite out-of-range values are clamped,
+	// while malformed non-finite values fail closed.
 	const gain = (gainDb) => buildGainCommand({ channelType: 0, channelIndex: 0, gainDb, mute: false }).readFloatLE(6)
 	assert.equal(gain(20), 6)
 	assert.equal(gain(-100), -80)
-	assert.equal(gain(Number.NaN), -80)
+	assert.throws(() => gain(Number.NaN), /finite number/)
+	assert.throws(() => gain(Number.POSITIVE_INFINITY), /finite number/)
 	assert.equal(gain(-4.5), -4.5)
 	const fader = buildFaderCommand({ channelType: 0, gains: [30, -200, ...Array(14).fill(0)] })
 	assert.equal(fader.readFloatLE(2), 6)
 	assert.equal(fader.readFloatLE(6), -80)
+	assert.throws(() => buildFaderCommand({ channelType: 0, gains: [Number.NaN, ...Array(15).fill(0)] }), /finite/)
 
 	// A mute toggle must not echo an out-of-range device gain read from 0x21.
 	const sent = []
@@ -2161,6 +2206,79 @@ test('every gain write is clamped to the device-safe -80..+6 dB window', async (
 		})
 		assert.equal(sent.length, 1, `channel ${channelCount + 1} must be rejected for type ${channelType}`)
 	}
+})
+
+test('Set Gain and Level Up/Down reject malformed safety inputs without transmitting', async () => {
+	const sent = []
+	const reports = []
+	const client = {
+		sendCommandExpect: async (cmd) => {
+			sent.push(Buffer.from(cmd))
+			return { success: true, rx: Buffer.from('3300', 'hex') }
+		},
+	}
+	const logger = { log: () => undefined, reportActionResult: (result) => reports.push(result) }
+	const actions = getActionDefinitions(client, logger)
+
+	for (const [index, gainDb] of [
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+		Number.NEGATIVE_INFINITY,
+		undefined,
+		null,
+		'',
+	].entries()) {
+		const controlId = `bad-gain-${index}`
+		await actions.set_gain.callback({
+			controlId,
+			options: { channelType: ChannelType.InputDsp, channelIndex: 1, gainDb, mute: false },
+		})
+		assert.equal(reports.at(-1).success, false)
+		assert.equal(reports.at(-1).controlId, controlId)
+	}
+
+	await actions.set_gain.callback({
+		controlId: 'bad-mute',
+		options: { channelType: ChannelType.InputDsp, channelIndex: 1, gainDb: 0, mute: 'false' },
+	})
+	assert.equal(reports.at(-1).success, false)
+	assert.equal(reports.at(-1).controlId, 'bad-mute')
+
+	await actions.adjust_gain.callback({
+		controlId: 'bad-direction',
+		options: { channelType: ChannelType.InputDsp, channel: 1, direction: 'sideways', deltaDb: 1 },
+	})
+	assert.equal(reports.at(-1).success, false)
+	assert.equal(reports.at(-1).controlId, 'bad-direction')
+	assert.deepEqual(sent, [])
+
+	// The documented boundaries remain valid and preserve 1-based UI to
+	// zero-based wire addressing.
+	await actions.set_gain.callback({
+		controlId: 'gain-min',
+		options: { channelType: ChannelType.InputDsp, channelIndex: 1, gainDb: -80, mute: false },
+	})
+	await actions.set_gain.callback({
+		controlId: 'gain-max',
+		options: { channelType: ChannelType.OutputDsp, channelIndex: 16, gainDb: 6, mute: true },
+	})
+	assert.equal(sent.length, 2)
+	assert.equal(sent[0].readInt32LE(2), 0)
+	assert.equal(sent[0].readFloatLE(6), -80)
+	assert.equal(sent[1].readInt32LE(2), 15)
+	assert.equal(sent[1].readFloatLE(6), 6)
+	assert.equal(sent[1][10], 1)
+})
+
+test('priority source variables expose 1-based values and hide the no-source sentinel', () => {
+	assert.equal(prioritySourceForOperator(0), 1)
+	assert.equal(prioritySourceForOperator(8), 9)
+	assert.equal(prioritySourceForOperator(215), 216)
+	assert.equal(prioritySourceForOperator(216), 'N/A')
+	assert.equal(prioritySourceForOperator(217), 'N/A')
+	assert.equal(prioritySourceForOperator(255), 'N/A')
+	assert.equal(prioritySourceForOperator(-1), 'N/A')
+	assert.equal(prioritySourceForOperator(undefined), 'N/A')
 })
 
 test('Set Gain migration preserves the target while changing the saved option to 1-based', () => {
@@ -2316,10 +2434,59 @@ test('preset audio read options are shared and carry the long transfer deadline'
 	const options = presetAudioReadOptions()
 	assert.equal(options.timeoutMs, SETTINGS.presetAudioTimeoutMs)
 	assert.equal(options.expectedLength, PRESET_AUDIO_RESPONSE_LENGTH)
-	assert.equal(options.isSuccess(Buffer.alloc(PRESET_AUDIO_RESPONSE_LENGTH, 0x33)), true)
+	const valid = Buffer.alloc(PRESET_AUDIO_RESPONSE_LENGTH)
+	valid[0] = 0x33
+	assert.equal(options.isSuccess(valid), true)
 	assert.equal(options.isSuccess(Buffer.alloc(10, 0x33)), false)
 	// The action queue TTL must always outlive one full transfer.
 	assert.ok(SETTINGS.actionQueueTtlMs > SETTINGS.presetAudioTimeoutMs)
+})
+
+test('preset-audio polling stays single-flight and recovers through bounded backoff', () => {
+	const recovery = new PresetAudioPollRecovery()
+
+	const first = recovery.begin(1000)
+	assert.equal(typeof first, 'number')
+	// Restarting only the profile cadence must not admit another 0x21 while the
+	// previous transfer is still active.
+	assert.equal(recovery.begin(5000), null)
+
+	const firstFailure = recovery.fail(first, 1000, 5000)
+	assert.deepEqual(firstFailure, {
+		accepted: true,
+		consecutiveFailures: 1,
+		retryDelayMs: 1000,
+		enteredBackoff: false,
+	})
+	assert.equal(recovery.begin(5999), null)
+
+	const second = recovery.begin(6000)
+	const secondFailure = recovery.fail(second, 1000, 6000)
+	assert.deepEqual(secondFailure, {
+		accepted: true,
+		consecutiveFailures: 2,
+		retryDelayMs: 5000,
+		enteredBackoff: true,
+	})
+	assert.equal(recovery.begin(10999), null)
+
+	const third = recovery.begin(11000)
+	const thirdFailure = recovery.fail(third, 1000, 11000)
+	assert.equal(thirdFailure.retryDelayMs, 10000)
+	const recoveredAttempt = recovery.begin(21000)
+	assert.deepEqual(recovery.succeed(recoveredAttempt), { accepted: true, recovered: true })
+	assert.equal(typeof recovery.begin(21000), 'number', 'success removes the retry delay')
+})
+
+test('preset-audio lifecycle reset prevents stale attempts releasing a newer transfer', () => {
+	const recovery = new PresetAudioPollRecovery()
+	const staleAttempt = recovery.begin(0)
+	recovery.reset()
+	const currentAttempt = recovery.begin(0)
+
+	assert.equal(recovery.release(staleAttempt), false)
+	assert.equal(recovery.begin(0), null, 'the current transfer remains in flight')
+	assert.deepEqual(recovery.succeed(currentAttempt), { accepted: true, recovered: false })
 })
 
 test('isLegacyErrResponse accepts only the bare two-byte rejection', () => {

@@ -21,15 +21,16 @@ const MAX_PENDING_COMMANDS = 32
 const RECONNECT_INTERVAL_MS = 10000
 
 /**
- * Rejection produced by queue governance (TTL expiry, poll eviction), not by
- * the device or the transport: the connection is healthy and a retry may
- * succeed. Consumers use isQueueRejection to keep backpressure out of
- * failure counters, "unsupported" marks and operator-facing error state.
+ * Rejection produced by queue governance (TTL expiry, poll eviction or the
+ * bounded queue reaching capacity), not by the device or the transport: the
+ * connection is healthy and a retry may succeed. Consumers use
+ * isQueueRejection to keep backpressure out of failure counters,
+ * "unsupported" marks and operator-facing error state.
  */
 export class QueueRejectionError extends Error {
 	constructor(
 		message: string,
-		readonly reason: 'expired' | 'evicted',
+		readonly reason: 'expired' | 'evicted' | 'full',
 	) {
 		super(message)
 		this.name = 'QueueRejectionError'
@@ -235,7 +236,9 @@ export class NewtonTcpClient extends EventEmitter<NewtonTcpClientEvents> {
 			// because it arrived first. Preserve the active command, but evict the
 			// oldest queued poll to make room for an operator action.
 			if (priority !== 'action' || !this.evictQueuedPollForAction()) {
-				return Promise.reject(new Error(`Command queue is full (maximum ${MAX_PENDING_COMMANDS} pending commands)`))
+				return Promise.reject(
+					new QueueRejectionError(`Command queue is full (maximum ${MAX_PENDING_COMMANDS} pending commands)`, 'full'),
+				)
 			}
 		}
 

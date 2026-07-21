@@ -563,7 +563,7 @@ export interface PresetAudioGains {
 export function parsePresetAudioGains(data: Buffer): PresetAudioGains | null {
 	const gainBase = LEGACY_HEADER_SIZE + PRESET_GAIN_OFFSET
 	const needed = gainBase + (PRESET_GAIN_OUTPUT_BASE + 16) * PRESET_GAIN_STRIDE
-	if (data.length < needed || data[0] !== REPLY_OK) return null
+	if (data.length < needed || data[0] !== REPLY_OK || data[1] !== 0x00) return null
 
 	const readEntry = (entryIndex: number): GainReadState | null => {
 		const offset = gainBase + entryIndex * PRESET_GAIN_STRIDE
